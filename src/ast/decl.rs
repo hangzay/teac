@@ -142,6 +142,17 @@ pub struct FnDef {
     pub stmts: CodeBlockStmtList,
 }
 
+/// An `impl` block that associates method definitions with a struct type.
+///
+/// Example: `impl Counter { fn get(&self) -> i32 { ... } }`
+#[derive(Debug, Clone)]
+pub struct ImplDef {
+    /// The name of the struct type this impl block belongs to.
+    pub name: String,
+    /// The method definitions contained in this impl block.
+    pub methods: Vec<FnDef>,
+}
+
 /// A function declaration used as a top-level statement (forward declaration).
 #[derive(Debug, Clone)]
 pub struct FnDeclStmt {

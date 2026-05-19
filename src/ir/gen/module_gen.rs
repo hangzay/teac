@@ -54,6 +54,7 @@ impl<'a> Generator for IrGenerator<'a> {
                 FnDeclStmt(fn_decl) => self.handle_fn_decl(fn_decl)?,
                 FnDef(fn_def) => self.handle_fn_def(fn_def)?,
                 StructDef(struct_def) => self.handle_struct_def(struct_def)?,
+                ImplDef(_) => {} // impl blocks not lowered to IR in this stage
             }
         }
 

@@ -1,7 +1,7 @@
 use crate::ast;
 
 use super::ParseContext;
-use super::common::{ParseResult, Pair, Rule, get_pos, grammar_error};
+use super::common::{grammar_error, get_pos, parse_num, Pair, ParseResult, Rule};
 
 impl<'a> ParseContext<'a> {
     /// Parses a `code_block_stmt` node into a boxed [`ast::CodeBlockStmt`].
@@ -51,6 +51,11 @@ impl<'a> ParseContext<'a> {
                 Rule::while_stmt => {
                     return Ok(Box::new(ast::CodeBlockStmt {
                         inner: ast::CodeBlockStmtInner::While(self.parse_while_stmt(inner)?),
+                    }));
+                }
+                Rule::for_stmt => {
+                    return Ok(Box::new(ast::CodeBlockStmt {
+                        inner: ast::CodeBlockStmtInner::For(self.parse_for_stmt(inner)?),
                     }));
                 }
                 Rule::return_stmt => {
@@ -249,5 +254,116 @@ impl<'a> ParseContext<'a> {
                 .ok_or_else(|| grammar_error("cond.bool_unit", &pair_for_error))?,
             stmts,
         }))
+    }
+
+    /// Parses a `for_stmt` node into a boxed [`ast::ForStmt`].
+    ///
+    /// A `for` statement has the form:
+    /// ```text
+    /// for <iterator> in <start>..<end> { <body> }
+    /// ```
+    /// The iterator name, start bound, end bound, and body statements are
+    /// extracted from the parse tree.  Returns [`Error::Grammar`] if either
+    /// bound is missing.
+    ///
+    /// # Arguments
+    /// * `pair` – the `for_stmt` parse-tree node.
+    fn parse_for_stmt(&self, pair: Pair) -> ParseResult<Box<ast::ForStmt>> {
+        let pair_for_error = pair.clone();
+        let mut iterator = String::new();
+        let mut start: Option<Box<ast::RangeBound>> = None;
+        let mut end: Option<Box<ast::RangeBound>> = None;
+        let mut stmts = Vec::new();
+
+        for inner in pair.into_inner() {
+            match inner.as_rule() {
+                Rule::identifier => {
+                    // First identifier is the loop variable; kw_for/kw_in are atomic rules
+                    // and do not appear as children of for_stmt.
+                    if iterator.is_empty() {
+                        iterator = inner.as_str().to_string();
+                    }
+                }
+                Rule::range_bound => {
+                    let bound = self.parse_range_bound(inner)?;
+                    if start.is_none() {
+                        start = Some(bound);
+                    } else {
+                        end = Some(bound);
+                    }
+                }
+                Rule::code_block_stmt => {
+                    stmts.push(*self.parse_code_block_stmt(inner)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Box::new(ast::ForStmt {
+            iterator,
+            start: start.ok_or_else(|| grammar_error("for_stmt.start", &pair_for_error))?,
+            end: end.ok_or_else(|| grammar_error("for_stmt.end", &pair_for_error))?,
+            stmts,
+        }))
+    }
+
+    /// Parses a `range_bound` node into a boxed [`ast::RangeBound`].
+    ///
+    /// A range bound is one of:
+    /// * `(<arith_expr>)` — a parenthesised arithmetic expression.
+    /// * A function call (`fn_call`).
+    /// * A numeric literal (`num`).
+    /// * A plain identifier.
+    ///
+    /// Returns [`Error::Grammar`] if none of the known forms is found.
+    ///
+    /// # Arguments
+    /// * `pair` – the `range_bound` parse-tree node.
+    fn parse_range_bound(&self, pair: Pair) -> ParseResult<Box<ast::RangeBound>> {
+        let pair_for_error = pair.clone();
+        let pos = get_pos(&pair);
+
+        // Collect children, stripping surrounding parentheses.
+        let inner_pairs: Vec<_> = pair.into_inner().collect();
+        let filtered: Vec<_> = inner_pairs
+            .iter()
+            .filter(|p| !matches!(p.as_rule(), Rule::lparen | Rule::rparen))
+            .cloned()
+            .collect();
+
+        for inner in &filtered {
+            match inner.as_rule() {
+                Rule::arith_expr => {
+                    return Ok(Box::new(ast::RangeBound {
+                        pos,
+                        inner: ast::RangeBoundInner::ArithExpr(
+                            self.parse_arith_expr(inner.clone())?,
+                        ),
+                    }));
+                }
+                Rule::fn_call => {
+                    return Ok(Box::new(ast::RangeBound {
+                        pos,
+                        inner: ast::RangeBoundInner::FnCall(self.parse_fn_call(inner.clone())?),
+                    }));
+                }
+                Rule::num => {
+                    let num = parse_num(inner.clone())?;
+                    return Ok(Box::new(ast::RangeBound {
+                        pos,
+                        inner: ast::RangeBoundInner::Num(num),
+                    }));
+                }
+                Rule::identifier => {
+                    return Ok(Box::new(ast::RangeBound {
+                        pos,
+                        inner: ast::RangeBoundInner::Id(inner.as_str().to_string()),
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        Err(grammar_error("range_bound", &pair_for_error))
     }
 }

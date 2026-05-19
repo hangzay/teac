@@ -5,7 +5,7 @@
 //! variable declarations/definitions, struct definitions, function forward
 //! declarations, and function definitions.
 
-use super::decl::{FnDeclStmt, FnDef, StructDef, VarDeclStmt};
+use super::decl::{FnDeclStmt, FnDef, ImplDef, StructDef, VarDeclStmt};
 
 /// A `use` statement that imports an external module into the current scope,
 /// e.g. `use io;`.
@@ -22,6 +22,8 @@ pub enum ProgramElementInner {
     VarDeclStmt(Box<VarDeclStmt>),
     /// A struct type definition.
     StructDef(Box<StructDef>),
+    /// An impl block associating methods with a struct type.
+    ImplDef(Box<ImplDef>),
     /// A function forward declaration (prototype).
     FnDeclStmt(Box<FnDeclStmt>),
     /// A function definition with a body.

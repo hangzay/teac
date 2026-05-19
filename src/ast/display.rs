@@ -5,31 +5,35 @@
 //! when printing error messages, debug output, and the tree-formatted program
 //! dump via [`super::tree::DisplayAsTree`].
 
+use super::decl::ImplDef;
 use super::expr::*;
 use super::ops::*;
 use super::program::Program;
+use super::stmt::{ForStmt, RangeBound, RangeBoundInner};
 use super::tree::DisplayAsTree;
 use super::types::*;
 use std::fmt::{Display, Error, Formatter};
 
-/// Formats a built-in type as its source-level keyword (e.g., `int`).
+/// Formats a built-in type as its source-level keyword (e.g., `i32`, `f32`).
 impl Display for BuiltIn {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
-            BuiltIn::Int => write!(f, "int"),
+            BuiltIn::Int => write!(f, "i32"),
+            BuiltIn::Float => write!(f, "f32"),
         }
     }
 }
 
 /// Formats a type-specifier inner node:
-/// built-ins use their keyword, composites use their name, and
-/// references are wrapped in `&[…]`.
+/// built-ins use their keyword, composites use their name,
+/// references are wrapped in `&[…]`, and arrays use `[elem; len]`.
 impl Display for TypeSpecifierInner {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
             TypeSpecifierInner::BuiltIn(b) => write!(f, "{}", b),
             TypeSpecifierInner::Composite(name) => write!(f, "{}", name),
             TypeSpecifierInner::Reference(inner) => write!(f, "&[{}]", inner.inner),
+            TypeSpecifierInner::Array(a) => write!(f, "[{}; {}]", a.element_type.inner, a.len),
         }
     }
 }
@@ -233,17 +237,25 @@ impl Display for MemberExpr {
     }
 }
 
-/// Formats a function call as `<name>(<args>)` or `<module>::<name>(<args>)`
-/// for qualified calls.
+/// Formats a function call as `<name>(<args>)`, `<module>::<name>(<args>)`,
+/// or `<receiver>.<name>(<args>)` for method calls.
 impl Display for FnCall {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        // Format all argument values as a comma-separated string.
         let args: Vec<String> = self.vals.iter().map(|v| format!("{}", v)).collect();
-        if let Some(module) = &self.module_prefix {
+        if let Some(receiver) = &self.receiver {
+            write!(f, "{}.{}({})", receiver, self.name, args.join(", "))
+        } else if let Some(module) = &self.module_prefix {
             write!(f, "{}::{}({})", module, self.name, args.join(", "))
         } else {
             write!(f, "{}({})", self.name, args.join(", "))
         }
+    }
+}
+
+/// Formats an impl block as `impl <name>`.
+impl Display for ImplDef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "impl {}", self.name)
     }
 }
 
@@ -252,12 +264,14 @@ impl Display for ExprUnitInner {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
             ExprUnitInner::Num(n) => write!(f, "{}", n),
+            ExprUnitInner::FloatNum(n) => write!(f, "{}", n),
             ExprUnitInner::Id(id) => write!(f, "{}", id),
             ExprUnitInner::ArithExpr(a) => write!(f, "{}", a),
             ExprUnitInner::FnCall(fc) => write!(f, "{}", fc),
             ExprUnitInner::ArrayExpr(ae) => write!(f, "{}", ae),
             ExprUnitInner::MemberExpr(me) => write!(f, "{}", me),
             ExprUnitInner::Reference(id) => write!(f, "&{}", id),
+            ExprUnitInner::Cast(c) => write!(f, "({} as {})", c.expr, c.target_type),
         }
     }
 }
@@ -266,6 +280,32 @@ impl Display for ExprUnitInner {
 impl Display for ExprUnit {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(f, "{}", self.inner)
+    }
+}
+
+/// Formats the inner part of a range bound.
+impl Display for RangeBoundInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        match self {
+            RangeBoundInner::ArithExpr(a) => write!(f, "({})", a),
+            RangeBoundInner::FnCall(fc) => write!(f, "{}", fc),
+            RangeBoundInner::Num(n) => write!(f, "{}", n),
+            RangeBoundInner::Id(id) => write!(f, "{}", id),
+        }
+    }
+}
+
+/// Formats a range bound by delegating to its inner representation.
+impl Display for RangeBound {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "{}", self.inner)
+    }
+}
+
+/// Formats a for statement as `for <iter> in <start>..<end>`.
+impl Display for ForStmt {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "for {} in {}..{}", self.iterator, self.start, self.end)
     }
 }
 

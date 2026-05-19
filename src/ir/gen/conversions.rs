@@ -26,6 +26,9 @@ fn base_dtype(type_specifier: &Option<ast::TypeSpecifier>) -> Dtype {
             element: Box::new(base_dtype(&Some(inner.as_ref().clone()))),
             length: None,
         }),
+        Some(ast::TypeSpecifierInner::Array(a)) => {
+            Dtype::array_of(base_dtype(&Some(*a.element_type.clone())), a.len)
+        }
         Some(ast::TypeSpecifierInner::BuiltIn(_)) | None => Dtype::I32,
     }
 }
@@ -90,6 +93,9 @@ impl From<&ast::TypeSpecifier> for Dtype {
                 element: Box::new(Self::from(inner.as_ref())),
                 length: None,
             }),
+            ast::TypeSpecifierInner::Array(a) => {
+                Dtype::array_of(Self::from(a.element_type.as_ref()), a.len)
+            }
         }
     }
 }

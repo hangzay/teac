@@ -54,6 +54,11 @@ impl<'a> ParseContext<'a> {
                         inner: ast::ProgramElementInner::StructDef(self.parse_struct_def(inner)?),
                     })));
                 }
+                Rule::impl_def => {
+                    return Ok(Some(Box::new(ast::ProgramElement {
+                        inner: ast::ProgramElementInner::ImplDef(self.parse_impl_def(inner)?),
+                    })));
+                }
                 Rule::fn_decl_stmt => {
                     return Ok(Some(Box::new(ast::ProgramElement {
                         inner: ast::ProgramElementInner::FnDeclStmt(
@@ -70,6 +75,31 @@ impl<'a> ParseContext<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Parses an `impl_def` node into a boxed [`ast::ImplDef`].
+    ///
+    /// An impl block has the form `impl TypeName { fn_def* }`. The method
+    /// extracts the struct type name and all contained method definitions.
+    pub(crate) fn parse_impl_def(&self, pair: Pair) -> ParseResult<Box<ast::ImplDef>> {
+        let mut name = String::new();
+        let mut methods = Vec::new();
+
+        for inner in pair.into_inner() {
+            match inner.as_rule() {
+                Rule::identifier => {
+                    if name.is_empty() {
+                        name = inner.as_str().to_string();
+                    }
+                }
+                Rule::fn_def => {
+                    methods.push(*self.parse_fn_def(inner)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Box::new(ast::ImplDef { name, methods }))
     }
 
     /// Parses a `struct_def` node into a boxed [`ast::StructDef`].
@@ -161,9 +191,10 @@ impl<'a> ParseContext<'a> {
 
     /// Parses a `type_spec` node into an optional [`ast::TypeSpecifier`].
     ///
-    /// Recognises reference types (`&T`), the built-in `i32` keyword, and
-    /// user-defined composite (struct) types by their identifier.  Returns
-    /// `Ok(None)` when the node is empty or contains no recognised type rule.
+    /// Recognises reference types (`&T`), the built-in `i32`/`f32` keywords,
+    /// array types (`[T; N]`), and user-defined composite (struct) types by
+    /// their identifier.  Returns `Ok(None)` when the node is empty or
+    /// contains no recognised type rule.
     ///
     /// # Arguments
     /// * `pair` – the `type_spec` parse-tree node.
@@ -176,7 +207,7 @@ impl<'a> ParseContext<'a> {
         for child in &children {
             match child.as_rule() {
                 Rule::ref_type => {
-                    // A reference type wraps an inner type_spec: `&<inner>`.
+                    // A reference type wraps an inner type_spec: `&[<inner>]`.
                     let ref_children: Vec<_> = child.clone().into_inner().collect();
                     let inner_type_spec = ref_children
                         .iter()
@@ -188,6 +219,39 @@ impl<'a> ParseContext<'a> {
                     return Ok(Some(ast::TypeSpecifier {
                         pos,
                         inner: ast::TypeSpecifierInner::Reference(Box::new(inner_ts)),
+                    }));
+                }
+                Rule::array_type => {
+                    // A fixed-length array type: `[element_type; N]`.
+                    let array_pair = child.clone();
+                    let inner_children: Vec<_> = array_pair.clone().into_inner().collect();
+                    let inner_ts_pair = inner_children
+                        .iter()
+                        .find(|c| c.as_rule() == Rule::type_spec)
+                        .ok_or_else(|| grammar_error("array_type.type_spec", &array_pair))?
+                        .clone();
+                    let num_pair = inner_children
+                        .iter()
+                        .find(|c| c.as_rule() == Rule::num)
+                        .ok_or_else(|| grammar_error("array_type.num", &array_pair))?
+                        .clone();
+                    let element_type = self
+                        .parse_type_spec(inner_ts_pair)?
+                        .ok_or_else(|| grammar_error("array_type.element_type", &array_pair))?;
+                    let len = parse_num(num_pair)? as usize;
+                    return Ok(Some(ast::TypeSpecifier {
+                        pos,
+                        inner: ast::TypeSpecifierInner::Array(Box::new(ast::ArrayTypeSpec {
+                            element_type: Box::new(element_type),
+                            len,
+                        })),
+                    }));
+                }
+                Rule::kw_f32 => {
+                    // Built-in 32-bit floating-point type.
+                    return Ok(Some(ast::TypeSpecifier {
+                        pos,
+                        inner: ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Float),
                     }));
                 }
                 Rule::kw_i32 => {
@@ -424,15 +488,17 @@ impl<'a> ParseContext<'a> {
     /// # Arguments
     /// * `pair` – the `param_decl` parse-tree node.
     fn parse_param_decl(&self, pair: Pair) -> ParseResult<Box<ast::ParamDecl>> {
-        let pair_for_error = pair.clone();
+        let mut decls = Vec::new();
+        // Iterate children: self_param is silently consumed (not stored in AST),
+        // typed_var_decl_list provides the regular parameters.
         for inner in pair.into_inner() {
             if inner.as_rule() == Rule::typed_var_decl_list {
-                return Ok(Box::new(ast::ParamDecl {
-                    decls: self.parse_typed_var_decl_list(inner)?,
-                }));
+                decls = self.parse_typed_var_decl_list(inner)?;
             }
+            // self_param is consumed but not stored; it affects semantics (receiver)
+            // at a later compilation stage.
         }
-        Err(grammar_error("param_decl", &pair_for_error))
+        Ok(Box::new(ast::ParamDecl { decls }))
     }
 
     /// Parses a `fn_def` node into a boxed [`ast::FnDef`].

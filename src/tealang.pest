@@ -71,6 +71,8 @@ semicolon = { ";" }
 colon = { ":" }
 // Example: "tail[i].next = head;"
 dot = { "." }
+// Example: "for i in 0..n { }" — must be atomic to prevent splitting into two dots
+dot_dot = @{ ".." }
 // Example: "std::getint()"
 double_colon = { "::" }
 // Example: "&[i32]" in function parameters
@@ -81,6 +83,12 @@ ampersand = { "&" }
 num = @{
     "0"
     | (ASCII_NONZERO_DIGIT ~ ASCII_DIGIT*)
+}
+
+// Floating-point literal: optional integer part + "." + required decimal part
+// Examples: "3.14", "2.0", ".5", "0.001", "100.0"
+float_literal = @{
+    ASCII_DIGIT* ~ "." ~ ASCII_DIGIT+
 }
 
 // Keywords (using @ for atomic rules to prevent whitespace inside)
@@ -103,9 +111,23 @@ kw_continue = @{ "continue" ~ &(WHITESPACE | semicolon) }
 // Example: "return 0;" or "return sum;"
 kw_return = @{ "return" ~ &(WHITESPACE | semicolon) }
 // Example: "let count:i32 = 0;"
-kw_i32 = @{ "i32" ~ &(WHITESPACE | semicolon | comma | rparen | lbrace | rbrace | rbracket | op_assign) }
+kw_i32 = @{ "i32" ~ &(WHITESPACE | semicolon | comma | rparen | lbrace | rbrace | rbracket | op_assign | colon) }
 // Example: "use std;"
 kw_use = @{ "use" ~ WHITESPACE }
+// Example: "let f:f32 = 3.14;"
+kw_f32 = @{ "f32" ~ &(WHITESPACE | semicolon | comma | rparen | lbrace | rbrace | rbracket | op_assign | colon) }
+// Example: "let x:i32 = y as i32;"
+kw_as = @{ "as" ~ WHITESPACE }
+// Example: "for i in 0..10 { }"
+kw_for = @{ "for" ~ WHITESPACE }
+// Example: "for i in 0..10 { }"
+kw_in = @{ "in" ~ WHITESPACE }
+// Example: "impl Counter { fn get(&self) -> i32 { } }"
+kw_impl = @{ "impl" ~ WHITESPACE }
+// Example: "fn add(&mut self, delta: i32) -> i32 { }"
+kw_mut = @{ "mut" ~ WHITESPACE }
+// Example: "&self" or "&mut self" in method parameter lists
+kw_self = @{ "self" ~ &(WHITESPACE | comma | rparen | dot | semicolon) }
 
 // Identifier: starts with letter or underscore, followed by letters, digits, or underscores
 // Cannot be a keyword: this step is performed after the keyword is recognized.
@@ -121,10 +143,18 @@ ref_type = {
     ampersand ~ lbracket ~ type_spec ~ rbracket
 }
 
-// Type specification: integer type, user-defined type, or reference type
-// Examples: "i32", "Node", "Queue", "&[i32]"
+// Array type: fixed-length array type supporting multi-dimensional arrays
+// Examples: "[i32; 4]", "[[i32; 4]; 3]" (outer uses typed_var_decl, inner is array_type in type_spec)
+array_type = {
+    lbracket ~ type_spec ~ semicolon ~ num ~ rbracket
+}
+
+// Type specification: integer type, float type, array type, user-defined type, or reference type
+// Examples: "i32", "f32", "Node", "Queue", "&[i32]", "[i32; 4]"
 type_spec = {
     ref_type
+    | array_type
+    | kw_f32
     | kw_i32
     | identifier
 }
@@ -143,11 +173,12 @@ use_stmt = {
     kw_use ~ identifier ~ (double_colon ~ identifier)* ~ semicolon
 }
 
-// Program element: variable declaration, struct definition, function declaration or definition
-// Examples: "let n:i32;", "struct Node { val:i32 }", "fn main() -> i32 { return 0; }"
+// Program element: variable declaration, struct definition, impl block, function declaration or definition
+// Examples: "let n:i32;", "struct Node { val:i32 }", "impl Node { ... }", "fn main() -> i32 { return 0; }"
 program_element = {
     var_decl_stmt
     | struct_def
+    | impl_def
     | fn_decl_stmt
     | fn_def
 }
@@ -217,16 +248,31 @@ fn_decl = {
     | kw_fn ~ identifier ~ lparen ~ param_decl? ~ rparen
 }
 
-// Parameter declaration: list of parameter variables (types required)
-// Example: "x:i32, y:i32" in "fn add(x:i32, y:i32) -> i32 { }"
+// Self parameter: receiver reference in method definitions
+// Examples: "&self" (immutable), "&mut self" (mutable)
+self_param = {
+    ampersand ~ kw_mut ~ kw_self
+    | ampersand ~ kw_self
+}
+
+// Parameter declaration: optional self receiver, followed by typed parameters
+// Examples: "&self", "&mut self, delta: i32", "x:i32, y:i32"
 param_decl = {
-    typed_var_decl_list
+    self_param ~ comma ~ typed_var_decl_list
+    | self_param
+    | typed_var_decl_list
 }
 
 // Function definition: declaration with implementation
 // Example: "fn main() -> i32 { let x:i32 = 0; return x; }"
 fn_def = {
     fn_decl ~ lbrace ~ code_block_stmt* ~ rbrace
+}
+
+// Impl definition: struct method implementations
+// Example: "impl Counter { fn get(&self) -> i32 { return self.value; } }"
+impl_def = {
+    kw_impl ~ identifier ~ lbrace ~ fn_def* ~ rbrace
 }
 
 // Statements
@@ -238,6 +284,7 @@ code_block_stmt = {
     | call_stmt
     | if_stmt
     | while_stmt
+    | for_stmt
     | return_stmt
     | continue_stmt
     | break_stmt
@@ -274,6 +321,24 @@ if_stmt = {
 // Examples: "while i < n { i = i + 1; }", "while (ch >= 48) && (ch <= 57) { }"
 while_stmt = {
     kw_while ~ bool_expr ~ lbrace ~ code_block_stmt* ~ rbrace
+}
+
+// Range bound: the start or end of a for-loop range
+// fn_call must precede identifier to avoid consuming the function name as a plain variable
+// Examples: "0", "n", "get_limit()", "(n + 1)"
+range_bound = {
+    lparen ~ arith_expr ~ rparen
+    | fn_call
+    | num
+    | identifier
+}
+
+// For statement: iterate over a half-open integer range [start, end)
+// dot_dot is atomic to prevent splitting; range_bound supports literals, vars, and calls
+// Examples: "for i in 0..10 { }", "for i in 0..n { }", "for i in 0..get_n() { }"
+for_stmt = {
+    kw_for ~ identifier ~ kw_in ~ range_bound ~ dot_dot ~ range_bound
+    ~ lbrace ~ code_block_stmt* ~ rbrace
 }
 
 // Break statement: exit from a loop
@@ -356,10 +421,17 @@ arith_expr = {
     arith_term ~ (arith_add_op ~ arith_term)*
 }
 
+// Cast expression: expr_unit with optional type cast via "as"
+// Examples: "x as f32", "arr[i] as i32", "3.14" (no cast)
+cast_expr = {
+    expr_unit ~ (kw_as ~ type_spec)?
+}
+
 // Arithmetic term: multiplication and division (higher precedence)
-// Examples: "x * 10", "num / base", "a * b / c"
+// cast_expr is used instead of expr_unit to support "as" with higher precedence than * /
+// Examples: "x * 10", "num / base", "a * b / c", "x as f32 * 2.0"
 arith_term = {
-    expr_unit ~ (arith_mul_op ~ expr_unit)*
+    cast_expr ~ (arith_mul_op ~ cast_expr)*
 }
 
 // Addition and subtraction operators
@@ -371,12 +443,15 @@ arith_mul_op = { op_mul | op_div }
 
 // Expression units (primary expressions)
 // Using postfix syntax to handle chaining: id[0].member[1]
-// Examples: "x", "10", "arr[i]", "node.value", "std::getint()", "0-x" (negative), "&arr"
+// float_literal must come before num to prevent "3" in "3.14" being consumed as num
+// Examples: "x", "10", "3.14", "arr[i]", "node.value", "std::getint()", "0-x" (negative), "&arr"
 expr_unit = {
     lparen ~ arith_expr ~ rparen
     | fn_call
     | ampersand ~ identifier           // address-of: &arr produces &[T] reference from array
-    | op_sub ~ num  // negative number
+    | op_sub ~ float_literal           // negative float (must precede op_sub ~ num)
+    | op_sub ~ num                     // negative integer
+    | float_literal                    // positive float (must precede num)
     | num
     | identifier ~ expr_suffix*
 }
@@ -400,11 +475,27 @@ left_val = {
     identifier ~ expr_suffix*
 }
 
+// Expression suffix without method call: array index or field access (no "(")
+// Used in method_call to collect receiver suffixes without consuming the method "."
+// Examples: "[0]" in "c[0].get()", ".pos" (not followed by "(") in "b[0].pos.len1()"
+expr_suffix_no_method = {
+    lbracket ~ index_expr ~ rbracket
+    | dot ~ identifier ~ !(lparen)
+}
+
+// Method call: object.method(args), receiver can have index/member suffixes
+// Examples: "c[0].get()", "self.add(delta)", "b[0].pos.len1()"
+method_call = {
+    identifier ~ expr_suffix_no_method* ~ dot ~ identifier ~ lparen ~ right_val_list? ~ rparen
+}
+
 // Function calls
-// Function call: either module-prefixed or local
-// Examples: "std::getint()", "quickread()", "addedge(x, y)"
+// Function call: method call, module-prefixed, or local
+// method_call must precede local_call to prevent "obj" from matching as local_call target
+// Examples: "std::getint()", "quickread()", "addedge(x, y)", "c[0].get()", "self.add(delta)"
 fn_call = {
     module_prefixed_call
+    | method_call
     | local_call
 }
 

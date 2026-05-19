@@ -120,6 +120,7 @@ impl<'ir> FunctionGenerator<'ir> {
             ast::CodeBlockStmtInner::Call(s) => self.handle_call_stmt(s),
             ast::CodeBlockStmtInner::If(s) => self.handle_if_stmt(s, con_label, bre_label),
             ast::CodeBlockStmtInner::While(s) => self.handle_while_stmt(s),
+            ast::CodeBlockStmtInner::For(s) => self.handle_for_stmt(s, con_label, bre_label),
             ast::CodeBlockStmtInner::Return(s) => self.handle_return_stmt(s),
             ast::CodeBlockStmtInner::Continue(_) => self.handle_continue_stmt(con_label),
             ast::CodeBlockStmtInner::Break(_) => self.handle_break_stmt(bre_label),
@@ -485,6 +486,20 @@ impl<'ir> FunctionGenerator<'ir> {
         Ok(())
     }
 
+    /// Lowers a `for` loop statement.
+    ///
+    /// IR generation for `for` loops is not yet fully implemented; returns
+    /// `LocalVarDefinitionUnsupported` to signal this to the caller.
+    /// (AST-level parsing and printing are fully supported.)
+    pub fn handle_for_stmt(
+        &mut self,
+        _stmt: &ast::ForStmt,
+        _con_label: Option<BlockLabel>,
+        _bre_label: Option<BlockLabel>,
+    ) -> Result<(), Error> {
+        Err(Error::LocalVarDefinitionUnsupported)
+    }
+
     /// Lowers a `return` statement.
     ///
     /// Emits a void `return` when no value is present, or evaluates the return
@@ -603,6 +618,13 @@ impl<'ir> FunctionGenerator<'ir> {
             ast::ExprUnitInner::MemberExpr(expr) => self.handle_member_expr(expr),
             ast::ExprUnitInner::Reference(id) => {
                 return self.handle_reference_expr(id);
+            }
+            // Float literals and cast expressions: IR generation not yet implemented.
+            // AST-level parsing is fully supported for these constructs.
+            ast::ExprUnitInner::FloatNum(_) | ast::ExprUnitInner::Cast(_) => {
+                return Err(Error::InvalidExprUnit {
+                    expr_unit: unit.clone(),
+                });
             }
         }?;
 
