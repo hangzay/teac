@@ -14,8 +14,7 @@ pub const TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
 
 /// Matching datalayout string.  See [`TARGET_TRIPLE`] for why it lives
 /// here.
-pub const TARGET_DATALAYOUT: &str =
-    "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128";
+pub const TARGET_DATALAYOUT: &str = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128";
 
 pub struct IrPrinter<W: Write> {
     writer: W,
@@ -88,8 +87,7 @@ impl<W: Write> IrPrinter<W> {
             (None, Dtype::I32) => "0".to_string(),
             (None, _) => "zeroinitializer".to_string(),
             (Some(inits), Dtype::Array { element, .. }) => {
-                let elems: Vec<String> =
-                    inits.iter().map(|v| format!("{element} {v}")).collect();
+                let elems: Vec<String> = inits.iter().map(|v| format!("{element} {v}")).collect();
                 format!("[{}]", elems.join(", "))
             }
             // Non-array globals have exactly one initializer (enforced by
@@ -123,13 +121,7 @@ impl<W: Write> IrPrinter<W> {
         let args = body
             .arguments
             .iter()
-            .map(|var| {
-                if matches!(&var.dtype, Dtype::Pointer { .. }) {
-                    format!("ptr %r{}", var.id.0)
-                } else {
-                    format!("{} %r{}", var.dtype, var.id.0)
-                }
-            })
+            .map(|var| format!("{} %r{}", var.dtype, var.id.0))
             .collect::<Vec<_>>()
             .join(", ");
 

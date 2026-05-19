@@ -5,6 +5,13 @@ use super::types::Dtype;
 use super::value::Operand;
 use std::fmt::{self, Display, Formatter};
 
+fn pointer_operand_dtype(ptr: &Operand) -> Dtype {
+    match ptr.dtype() {
+        Dtype::Pointer { .. } => ptr.dtype().clone(),
+        other => Dtype::ptr_to(other.clone()),
+    }
+}
+
 #[derive(Clone)]
 pub enum ArithBinOp {
     Add,
@@ -31,6 +38,36 @@ impl Display for ArithBinOp {
             ArithBinOp::Sub => write!(f, "sub"),
             ArithBinOp::Mul => write!(f, "mul"),
             ArithBinOp::SDiv => write!(f, "sdiv"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum FloatBinOp {
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+}
+
+impl From<&ast::ArithBiOp> for FloatBinOp {
+    fn from(value: &ast::ArithBiOp) -> Self {
+        match value {
+            ast::ArithBiOp::Add => FloatBinOp::FAdd,
+            ast::ArithBiOp::Sub => FloatBinOp::FSub,
+            ast::ArithBiOp::Mul => FloatBinOp::FMul,
+            ast::ArithBiOp::Div => FloatBinOp::FDiv,
+        }
+    }
+}
+
+impl Display for FloatBinOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            FloatBinOp::FAdd => write!(f, "fadd"),
+            FloatBinOp::FSub => write!(f, "fsub"),
+            FloatBinOp::FMul => write!(f, "fmul"),
+            FloatBinOp::FDiv => write!(f, "fdiv"),
         }
     }
 }
@@ -72,18 +109,58 @@ impl Display for CmpPredicate {
 }
 
 #[derive(Clone)]
+pub enum FloatCmpPredicate {
+    Oeq,
+    One,
+    Ogt,
+    Oge,
+    Olt,
+    Ole,
+}
+
+impl From<&ast::ComOp> for FloatCmpPredicate {
+    fn from(value: &ast::ComOp) -> Self {
+        match value {
+            ast::ComOp::Eq => FloatCmpPredicate::Oeq,
+            ast::ComOp::Ne => FloatCmpPredicate::One,
+            ast::ComOp::Gt => FloatCmpPredicate::Ogt,
+            ast::ComOp::Ge => FloatCmpPredicate::Oge,
+            ast::ComOp::Lt => FloatCmpPredicate::Olt,
+            ast::ComOp::Le => FloatCmpPredicate::Ole,
+        }
+    }
+}
+
+impl Display for FloatCmpPredicate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            FloatCmpPredicate::Oeq => write!(f, "oeq"),
+            FloatCmpPredicate::One => write!(f, "one"),
+            FloatCmpPredicate::Ogt => write!(f, "ogt"),
+            FloatCmpPredicate::Oge => write!(f, "oge"),
+            FloatCmpPredicate::Olt => write!(f, "olt"),
+            FloatCmpPredicate::Ole => write!(f, "ole"),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum StmtInner {
     Call(CallStmt),
     Load(LoadStmt),
     Phi(PhiStmt),
     BiOp(BiOpStmt),
+    FBiOp(FBiOpStmt),
     Alloca(AllocaStmt),
     Cmp(CmpStmt),
+    FCmp(FCmpStmt),
     CJump(CJumpStmt),
     Label(LabelStmt),
     Store(StoreStmt),
     Jump(JumpStmt),
     Gep(GepStmt),
+    SIToFP(SIToFPStmt),
+    FPToSI(FPToSIStmt),
     Return(ReturnStmt),
 }
 
@@ -151,6 +228,17 @@ impl Stmt {
         }
     }
 
+    pub fn as_fbiop(kind: FloatBinOp, left: Operand, right: Operand, dst: Operand) -> Self {
+        Self {
+            inner: StmtInner::FBiOp(FBiOpStmt {
+                kind,
+                left,
+                right,
+                dst,
+            }),
+        }
+    }
+
     pub fn as_alloca(dst: Operand) -> Self {
         Self {
             inner: StmtInner::Alloca(AllocaStmt { dst }),
@@ -160,6 +248,17 @@ impl Stmt {
     pub fn as_cmp(kind: CmpPredicate, left: Operand, right: Operand, dst: Operand) -> Self {
         Self {
             inner: StmtInner::Cmp(CmpStmt {
+                kind,
+                left,
+                right,
+                dst,
+            }),
+        }
+    }
+
+    pub fn as_fcmp(kind: FloatCmpPredicate, left: Operand, right: Operand, dst: Operand) -> Self {
+        Self {
+            inner: StmtInner::FCmp(FCmpStmt {
                 kind,
                 left,
                 right,
@@ -211,6 +310,18 @@ impl Stmt {
             }),
         }
     }
+
+    pub fn as_sitofp(src: Operand, dst: Operand) -> Self {
+        Self {
+            inner: StmtInner::SIToFP(SIToFPStmt { src, dst }),
+        }
+    }
+
+    pub fn as_fptosi(src: Operand, dst: Operand) -> Self {
+        Self {
+            inner: StmtInner::FPToSI(FPToSIStmt { src, dst }),
+        }
+    }
 }
 
 impl Display for Stmt {
@@ -218,13 +329,17 @@ impl Display for Stmt {
         match &self.inner {
             StmtInner::Alloca(s) => write!(f, "\t{s}"),
             StmtInner::BiOp(s) => write!(f, "\t{s}"),
+            StmtInner::FBiOp(s) => write!(f, "\t{s}"),
             StmtInner::CJump(s) => write!(f, "\t{s}"),
             StmtInner::Call(s) => write!(f, "\t{s}"),
             StmtInner::Cmp(s) => write!(f, "\t{s}"),
+            StmtInner::FCmp(s) => write!(f, "\t{s}"),
             StmtInner::Gep(s) => write!(f, "\t{s}"),
             StmtInner::Label(s) => write!(f, "{s}"),
             StmtInner::Load(s) => write!(f, "\t{s}"),
             StmtInner::Phi(s) => write!(f, "\t{s}"),
+            StmtInner::SIToFP(s) => write!(f, "\t{s}"),
+            StmtInner::FPToSI(s) => write!(f, "\t{s}"),
             StmtInner::Return(s) => write!(f, "\t{s}"),
             StmtInner::Store(s) => write!(f, "\t{s}"),
             StmtInner::Jump(s) => write!(f, "\t{s}"),
@@ -263,6 +378,14 @@ pub struct BiOpStmt {
 }
 
 #[derive(Clone)]
+pub struct FBiOpStmt {
+    pub kind: FloatBinOp,
+    pub left: Operand,
+    pub right: Operand,
+    pub dst: Operand,
+}
+
+#[derive(Clone)]
 pub struct AllocaStmt {
     pub dst: Operand,
 }
@@ -270,6 +393,14 @@ pub struct AllocaStmt {
 #[derive(Clone)]
 pub struct CmpStmt {
     pub kind: CmpPredicate,
+    pub left: Operand,
+    pub right: Operand,
+    pub dst: Operand,
+}
+
+#[derive(Clone)]
+pub struct FCmpStmt {
+    pub kind: FloatCmpPredicate,
     pub left: Operand,
     pub right: Operand,
     pub dst: Operand,
@@ -306,6 +437,18 @@ pub struct GepStmt {
 }
 
 #[derive(Clone)]
+pub struct SIToFPStmt {
+    pub src: Operand,
+    pub dst: Operand,
+}
+
+#[derive(Clone)]
+pub struct FPToSIStmt {
+    pub src: Operand,
+    pub dst: Operand,
+}
+
+#[derive(Clone)]
 pub struct ReturnStmt {
     pub val: Option<Operand>,
 }
@@ -315,13 +458,7 @@ impl Display for CallStmt {
         let args = self
             .args
             .iter()
-            .map(|a| {
-                if matches!(a.dtype(), Dtype::Pointer { .. } | Dtype::Array { .. }) {
-                    format!("ptr {a}")
-                } else {
-                    format!("{} {a}", a.dtype())
-                }
-            })
+            .map(|a| format!("{} {a}", a.dtype()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -337,7 +474,12 @@ impl Display for CallStmt {
 impl Display for LoadStmt {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let Self { dst, ptr } = self;
-        write!(f, "{dst} = load {}, ptr {ptr}, align 4", dst.dtype())
+        let ptr_dtype = pointer_operand_dtype(ptr);
+        write!(
+            f,
+            "{dst} = load {}, {ptr_dtype} {ptr}, align 4",
+            dst.dtype()
+        )
     }
 }
 
@@ -358,7 +500,8 @@ impl Display for PhiStmt {
 impl Display for StoreStmt {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let Self { src, ptr } = self;
-        write!(f, "store {} {src}, ptr {ptr}, align 4", src.dtype())
+        let ptr_dtype = pointer_operand_dtype(ptr);
+        write!(f, "store {} {src}, {ptr_dtype} {ptr}, align 4", src.dtype())
     }
 }
 
@@ -385,6 +528,18 @@ impl Display for BiOpStmt {
     }
 }
 
+impl Display for FBiOpStmt {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self {
+            kind,
+            left,
+            right,
+            dst,
+        } = self;
+        write!(f, "{dst} = {kind} {} {left}, {right}", dst.dtype())
+    }
+}
+
 impl Display for CmpStmt {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let Self {
@@ -394,6 +549,18 @@ impl Display for CmpStmt {
             dst,
         } = self;
         write!(f, "{dst} = icmp {kind} {} {left}, {right}", left.dtype())
+    }
+}
+
+impl Display for FCmpStmt {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self {
+            kind,
+            left,
+            right,
+            dst,
+        } = self;
+        write!(f, "{dst} = fcmp {kind} {} {left}, {right}", left.dtype())
     }
 }
 
@@ -427,6 +594,7 @@ impl Display for GepStmt {
             base_ptr,
             index,
         } = self;
+        let base_ptr_dtype = pointer_operand_dtype(base_ptr);
         match base_ptr.dtype() {
             Dtype::Pointer { pointee } => match pointee.as_ref() {
                 Dtype::Array {
@@ -434,23 +602,23 @@ impl Display for GepStmt {
                 }
                 | Dtype::Struct { .. } => write!(
                     f,
-                    "{new_ptr} = getelementptr {pointee}, ptr {base_ptr}, i32 0, i32 {index}",
+                    "{new_ptr} = getelementptr {pointee}, {base_ptr_dtype} {base_ptr}, i32 0, i32 {index}",
                 ),
                 Dtype::Array {
                     element,
                     length: None,
                 } => write!(
                     f,
-                    "{new_ptr} = getelementptr {element}, ptr {base_ptr}, i32 {index}",
+                    "{new_ptr} = getelementptr {element}, {base_ptr_dtype} {base_ptr}, i32 {index}",
                 ),
                 _ => write!(
                     f,
-                    "{new_ptr} = getelementptr {pointee}, ptr {base_ptr}, i32 {index}",
+                    "{new_ptr} = getelementptr {pointee}, {base_ptr_dtype} {base_ptr}, i32 {index}",
                 ),
             },
             dtype @ Dtype::Array { .. } => write!(
                 f,
-                "{new_ptr} = getelementptr {dtype}, ptr {base_ptr}, i32 0, i32 {index}",
+                "{new_ptr} = getelementptr {dtype}, {base_ptr_dtype} {base_ptr}, i32 0, i32 {index}",
             ),
             _ => Err(fmt::Error),
         }
@@ -463,6 +631,20 @@ impl Display for ReturnStmt {
             Some(v) => write!(f, "ret {} {v}", v.dtype()),
             None => write!(f, "ret void"),
         }
+    }
+}
+
+impl Display for SIToFPStmt {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { src, dst } = self;
+        write!(f, "{dst} = sitofp {} {src} to {}", src.dtype(), dst.dtype())
+    }
+}
+
+impl Display for FPToSIStmt {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { src, dst } = self;
+        write!(f, "{dst} = fptosi {} {src} to {}", src.dtype(), dst.dtype())
     }
 }
 
@@ -480,7 +662,9 @@ impl Stmt {
             StmtInner::Load(s) => vec![r(&s.dst, Def), r(&s.ptr, LoadPtr)],
             StmtInner::Store(s) => vec![r(&s.src, Use), r(&s.ptr, StorePtr)],
             StmtInner::BiOp(s) => vec![r(&s.dst, Def), r(&s.left, Use), r(&s.right, Use)],
+            StmtInner::FBiOp(s) => vec![r(&s.dst, Def), r(&s.left, Use), r(&s.right, Use)],
             StmtInner::Cmp(s) => vec![r(&s.dst, Def), r(&s.left, Use), r(&s.right, Use)],
+            StmtInner::FCmp(s) => vec![r(&s.dst, Def), r(&s.left, Use), r(&s.right, Use)],
             StmtInner::CJump(s) => vec![r(&s.cond, Use)],
             StmtInner::Call(s) => {
                 let mut ops = Vec::with_capacity(s.args.len() + 1);
@@ -490,12 +674,10 @@ impl Stmt {
                 ops.extend(s.args.iter().map(|a| r(a, Use)));
                 ops
             }
-            StmtInner::Gep(s) => vec![
-                r(&s.new_ptr, Def),
-                r(&s.base_ptr, Use),
-                r(&s.index, Use),
-            ],
+            StmtInner::Gep(s) => vec![r(&s.new_ptr, Def), r(&s.base_ptr, Use), r(&s.index, Use)],
             StmtInner::Return(s) => s.val.as_ref().map_or_else(Vec::new, |v| vec![r(v, Use)]),
+            StmtInner::SIToFP(s) => vec![r(&s.dst, Def), r(&s.src, Use)],
+            StmtInner::FPToSI(s) => vec![r(&s.dst, Def), r(&s.src, Use)],
             StmtInner::Phi(s) => {
                 let mut ops = Vec::with_capacity(s.incomings.len() + 1);
                 ops.push(r(&s.dst, Def));
@@ -514,8 +696,14 @@ impl Stmt {
             StmtInner::BiOp(s) => {
                 Stmt::as_biop(s.kind.clone(), f(&s.left), f(&s.right), s.dst.clone())
             }
+            StmtInner::FBiOp(s) => {
+                Stmt::as_fbiop(s.kind.clone(), f(&s.left), f(&s.right), s.dst.clone())
+            }
             StmtInner::Cmp(s) => {
                 Stmt::as_cmp(s.kind.clone(), f(&s.left), f(&s.right), s.dst.clone())
+            }
+            StmtInner::FCmp(s) => {
+                Stmt::as_fcmp(s.kind.clone(), f(&s.left), f(&s.right), s.dst.clone())
             }
             StmtInner::CJump(s) => {
                 Stmt::as_cjump(f(&s.cond), s.true_label.clone(), s.false_label.clone())
@@ -526,6 +714,8 @@ impl Stmt {
             }
             StmtInner::Gep(s) => Stmt::as_gep(s.new_ptr.clone(), f(&s.base_ptr), f(&s.index)),
             StmtInner::Return(s) => Stmt::as_return(s.val.as_ref().map(&f)),
+            StmtInner::SIToFP(s) => Stmt::as_sitofp(f(&s.src), s.dst.clone()),
+            StmtInner::FPToSI(s) => Stmt::as_fptosi(f(&s.src), s.dst.clone()),
             StmtInner::Phi(s) => {
                 let incomings = s
                     .incomings

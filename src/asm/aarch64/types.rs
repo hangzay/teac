@@ -52,7 +52,7 @@ pub enum IndexOperand {
 
 pub fn dtype_to_regsize(dtype: &ir::Dtype) -> Result<RegSize, Error> {
     match dtype {
-        ir::Dtype::I1 | ir::Dtype::I32 => Ok(RegSize::W32),
+        ir::Dtype::I1 | ir::Dtype::I32 | ir::Dtype::F32 => Ok(RegSize::W32),
         ir::Dtype::Pointer { .. } => Ok(RegSize::X64),
         _ => Err(Error::UnsupportedDtype {
             dtype: dtype.clone(),

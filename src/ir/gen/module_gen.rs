@@ -66,6 +66,7 @@ impl Generator for IrGenerator<'_> {
                 ast::ProgramElementInner::StructDef(struct_def) => {
                     self.handle_struct_def(struct_def)?;
                 }
+                ast::ProgramElementInner::ImplDef(_) => {}
             }
         }
 

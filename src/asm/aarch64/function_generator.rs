@@ -481,6 +481,9 @@ impl<'a> FunctionGenerator<'a> {
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: format!("unsupported int operand: {}", val),
             }),
+            ir::Operand::FloatConst(_) => Err(Error::UnsupportedDtype {
+                dtype: ir::Dtype::F32,
+            }),
         }
     }
 
@@ -527,6 +530,9 @@ impl<'a> FunctionGenerator<'a> {
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: "unexpected global variable in value position".into(),
             }),
+            ir::Operand::FloatConst(_) => Err(Error::UnsupportedDtype {
+                dtype: ir::Dtype::F32,
+            }),
         }
     }
 
@@ -568,12 +574,14 @@ impl<'a> FunctionGenerator<'a> {
                     dtype: l.dtype.clone(),
                 })
             }
-            ir::Operand::Global(g) => Ok((
-                PtrBase::Global(self.target.mangle_symbol(&g.name)),
-                None,
-            )),
+            ir::Operand::Global(g) => {
+                Ok((PtrBase::Global(self.target.mangle_symbol(&g.name)), None))
+            }
             ir::Operand::Const(_) => Err(Error::UnsupportedOperand {
                 what: format!("unsupported pointer operand: {}", val),
+            }),
+            ir::Operand::FloatConst(_) => Err(Error::UnsupportedDtype {
+                dtype: ir::Dtype::F32,
             }),
         }
     }
@@ -597,12 +605,18 @@ impl<'a> FunctionGenerator<'a> {
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: format!("unsupported index operand: {}", val),
             }),
+            ir::Operand::FloatConst(_) => Err(Error::UnsupportedDtype {
+                dtype: ir::Dtype::F32,
+            }),
         }
     }
 
     fn lower_index_imm(&self, val: &ir::Operand) -> Result<i64, Error> {
         match val {
             ir::Operand::Const(c) => Ok(c.val),
+            ir::Operand::FloatConst(_) => Err(Error::UnsupportedDtype {
+                dtype: ir::Dtype::F32,
+            }),
             _ => Err(Error::UnsupportedOperand {
                 what: format!("expected immediate struct field index, got: {}", val),
             }),
@@ -621,6 +635,9 @@ impl<'a> FunctionGenerator<'a> {
             Load(s) => self.emit_load(s),
             BiOp(s) => self.emit_biop(s),
             Cmp(s) => self.emit_cmp(s),
+            FBiOp(_) | FCmp(_) | SIToFP(_) | FPToSI(_) => Err(Error::UnsupportedDtype {
+                dtype: ir::Dtype::F32,
+            }),
             CJump(s) => self.emit_cjump(s),
             Jump(s) => {
                 self.emit_jump(s);
@@ -645,6 +662,11 @@ impl<'a> FunctionGenerator<'a> {
             ir::Operand::Global(_) => {
                 return Err(Error::UnsupportedOperand {
                     what: "global variable in phi copy".into(),
+                });
+            }
+            ir::Operand::FloatConst(_) => {
+                return Err(Error::UnsupportedDtype {
+                    dtype: ir::Dtype::F32,
                 });
             }
         };

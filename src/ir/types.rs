@@ -6,6 +6,7 @@ pub enum Dtype {
     Void,
     I1,
     I32,
+    F32,
     Struct {
         type_name: String,
     },
@@ -47,9 +48,10 @@ impl Display for Dtype {
         match self {
             Dtype::I1 => write!(f, "i1"),
             Dtype::I32 => write!(f, "i32"),
+            Dtype::F32 => write!(f, "float"),
             Dtype::Void => write!(f, "void"),
             Dtype::Struct { type_name } => write!(f, "%{type_name}"),
-            Dtype::Pointer { .. } => write!(f, "ptr"),
+            Dtype::Pointer { pointee } => write!(f, "{}*", pointee.as_ref()),
             Dtype::Array {
                 element,
                 length: Some(length),
@@ -90,19 +92,16 @@ impl TryFrom<&ast::FnDecl> for FunctionType {
     /// 1. Array parameters are rejected with
     ///    [`crate::ir::Error::ArrayParameterNotAllowed`] — TeaLang requires
     ///    arrays to be passed by reference (`&[T]`).
-    /// 2. Return types are whitelisted to `void` and `i32`.  Struct returns
+    /// 2. Return types are whitelisted to `void`, `i32`, and `f32`. Struct returns
     ///    are grammatically legal but not yet implemented in the AArch64
     ///    back-end; allowing them here would produce IR that can't be
     ///    lowered, so they are rejected up-front with
     ///    [`crate::ir::Error::UnsupportedReturnType`].
     fn try_from(decl: &ast::FnDecl) -> Result<Self, Self::Error> {
-        let return_dtype = decl
-            .return_dtype
-            .as_ref()
-            .map_or(Dtype::Void, Dtype::from);
+        let return_dtype = decl.return_dtype.as_ref().map_or(Dtype::Void, Dtype::from);
 
         match &return_dtype {
-            Dtype::Void | Dtype::I32 => {}
+            Dtype::Void | Dtype::I32 | Dtype::F32 => {}
             _ => {
                 return Err(crate::ir::Error::UnsupportedReturnType {
                     symbol: decl.identifier.clone(),

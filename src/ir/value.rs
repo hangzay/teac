@@ -9,7 +9,8 @@
 //!   appear inside an instruction operand.
 //! * **References** are the typed handles that an instruction operand
 //!   carries: [`Local`] = `(LocalId, Dtype)`, [`GlobalRef`] = `(Rc<str>,
-//!   Dtype)`, [`IntConst`] = `(Dtype, i64)`.  All three are cheap to clone,
+//!   Dtype)`, [`IntConst`] = `(Dtype, i64)`, [`FloatConst`] = `(Dtype, f32)`.
+//!   All four are cheap to clone,
 //!   so propagating operands through passes does not drag any per-value
 //!   heap data along.
 
@@ -98,15 +99,35 @@ impl Display for IntConst {
     }
 }
 
+/// A typed floating-point constant operand.
+///
+/// LLVM prints `float` constants as exact double-precision hexadecimal
+/// literals. The stored value is already rounded to f32, then widened to f64
+/// when displayed so LLVM accepts it without precision-loss diagnostics.
+#[derive(Clone)]
+pub struct FloatConst {
+    pub dtype: Dtype,
+    pub val: f32,
+}
+
+impl Display for FloatConst {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let widened = f64::from(self.val);
+        write!(f, "0x{:016X}", widened.to_bits())
+    }
+}
+
 /// Instruction operand.
 ///
 /// Exactly one of:
 /// * a typed integer constant,
+/// * a typed floating-point constant,
 /// * a reference to a local SSA value inside the same function, or
 /// * a reference to a module-level global.
 #[derive(Clone)]
 pub enum Operand {
     Const(IntConst),
+    FloatConst(FloatConst),
     Local(Local),
     Global(GlobalRef),
 }
@@ -116,6 +137,7 @@ impl Operand {
     pub fn dtype(&self) -> &Dtype {
         match self {
             Operand::Const(c) => &c.dtype,
+            Operand::FloatConst(c) => &c.dtype,
             Operand::Local(l) => &l.dtype,
             Operand::Global(g) => &g.dtype,
         }
@@ -129,7 +151,7 @@ impl Operand {
         }
     }
 
-    /// True for any operand other than an integer constant — i.e. anything
+    /// True for any operand other than a constant — i.e. anything
     /// that denotes a named vreg or a global symbol and could therefore
     /// hold an address.  The front-end pairs this predicate with a
     /// separate `Dtype::Pointer` check to decide whether to insert an
@@ -143,6 +165,7 @@ impl Display for Operand {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Operand::Const(c) => Display::fmt(c, f),
+            Operand::FloatConst(c) => Display::fmt(c, f),
             Operand::Local(l) => Display::fmt(l, f),
             Operand::Global(g) => Display::fmt(g, f),
         }
@@ -172,6 +195,15 @@ impl From<i32> for Operand {
         Operand::Const(IntConst {
             dtype: Dtype::I32,
             val: i64::from(v),
+        })
+    }
+}
+
+impl From<f32> for Operand {
+    fn from(v: f32) -> Self {
+        Operand::FloatConst(FloatConst {
+            dtype: Dtype::F32,
+            val: v,
         })
     }
 }

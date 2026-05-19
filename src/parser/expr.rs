@@ -3,6 +3,11 @@ use crate::ast;
 use super::common::{get_pos, grammar_error, parse_num, Pair, ParseResult, Rule};
 use super::ParseContext;
 
+/// Parses a floating-point literal string into an `f32` value.
+fn parse_float(s: &str) -> f32 {
+    s.parse::<f32>().unwrap_or(0.0)
+}
+
 impl<'a> ParseContext<'a> {
     /// Parses a `right_val_list` node into a `Vec` of [`ast::RightVal`].
     ///
@@ -354,7 +359,7 @@ impl<'a> ParseContext<'a> {
 
     /// Parses an `arith_term` node into a boxed [`ast::ArithExpr`].
     ///
-    /// An arithmetic term is a sequence of `expr_unit` nodes optionally
+    /// An arithmetic term is a sequence of `cast_expr` nodes optionally
     /// combined with multiplicative operators (`*`, `/`).  The method builds a
     /// left-associative tree of [`ast::ArithBiOpExpr`] nodes.
     ///
@@ -368,8 +373,8 @@ impl<'a> ParseContext<'a> {
             return Err(grammar_error("arith_term", &pair_for_error));
         }
 
-        // Seed the accumulator with the first expression unit.
-        let first_unit = self.parse_expr_unit(inner_pairs[0].clone())?;
+        // Seed the accumulator with the first cast_expr (which wraps an expr_unit).
+        let first_unit = self.parse_cast_expr(inner_pairs[0].clone())?;
         let mut expr = Box::new(ast::ArithExpr {
             pos: first_unit.pos,
             inner: ast::ArithExprInner::ExprUnit(first_unit),
@@ -380,7 +385,7 @@ impl<'a> ParseContext<'a> {
         while i < inner_pairs.len() {
             if inner_pairs[i].as_rule() == Rule::arith_mul_op {
                 let op = self.parse_arith_mul_op(inner_pairs[i].clone())?;
-                let right_unit = self.parse_expr_unit(inner_pairs[i + 1].clone())?;
+                let right_unit = self.parse_cast_expr(inner_pairs[i + 1].clone())?;
                 let right = Box::new(ast::ArithExpr {
                     pos: right_unit.pos,
                     inner: ast::ArithExprInner::ExprUnit(right_unit),
@@ -401,6 +406,45 @@ impl<'a> ParseContext<'a> {
         }
 
         Ok(expr)
+    }
+
+    /// Parses a `cast_expr` node into a boxed [`ast::ExprUnit`].
+    ///
+    /// A cast expression is an `expr_unit` with an optional `as <type>` suffix.
+    /// If no cast is present, the inner `expr_unit` is returned unchanged.
+    /// If a cast is present, the result is wrapped in [`ast::ExprUnitInner::Cast`].
+    ///
+    /// # Arguments
+    /// * `pair` – the `cast_expr` parse-tree node.
+    fn parse_cast_expr(&self, pair: Pair) -> ParseResult<Box<ast::ExprUnit>> {
+        let pair_for_error = pair.clone();
+        let pos = get_pos(&pair);
+        let inner_pairs: Vec<_> = pair.into_inner().collect();
+
+        if inner_pairs.is_empty() {
+            return Err(grammar_error("cast_expr", &pair_for_error));
+        }
+
+        // First child is always the expr_unit.
+        let expr_unit = self.parse_expr_unit(inner_pairs[0].clone())?;
+
+        // Check for optional cast: (kw_as ~ type_spec)?
+        let type_spec_pair = inner_pairs.iter().find(|p| p.as_rule() == Rule::type_spec);
+
+        if let Some(ts_pair) = type_spec_pair {
+            let target_type = self
+                .parse_type_spec(ts_pair.clone())?
+                .ok_or_else(|| grammar_error("cast_expr.target_type", &pair_for_error))?;
+            return Ok(Box::new(ast::ExprUnit {
+                pos,
+                inner: ast::ExprUnitInner::Cast(Box::new(ast::CastExpr {
+                    expr: expr_unit,
+                    target_type,
+                })),
+            }));
+        }
+
+        Ok(expr_unit)
     }
 
     /// Parses an `arith_add_op` node into an [`ast::ArithBiOp`] additive variant.
@@ -469,6 +513,18 @@ impl<'a> ParseContext<'a> {
             .cloned()
             .collect();
 
+        // `-<float_literal>` — negated floating-point literal.
+        if filtered.len() == 2
+            && filtered[0].as_rule() == Rule::op_sub
+            && filtered[1].as_rule() == Rule::float_literal
+        {
+            let fval = parse_float(filtered[1].as_str());
+            return Ok(Box::new(ast::ExprUnit {
+                pos,
+                inner: ast::ExprUnitInner::FloatNum(-fval),
+            }));
+        }
+
         // `-<num>` — negated integer literal.
         if filtered.len() == 2
             && filtered[0].as_rule() == Rule::op_sub
@@ -494,6 +550,15 @@ impl<'a> ParseContext<'a> {
             return Ok(Box::new(ast::ExprUnit {
                 pos,
                 inner: ast::ExprUnitInner::FnCall(self.parse_fn_call(filtered[0].clone())?),
+            }));
+        }
+
+        // `<float_literal>` — positive floating-point literal (must precede num check).
+        if filtered.len() == 1 && filtered[0].as_rule() == Rule::float_literal {
+            let fval = parse_float(filtered[0].as_str());
+            return Ok(Box::new(ast::ExprUnit {
+                pos,
+                inner: ast::ExprUnitInner::FloatNum(fval),
             }));
         }
 
@@ -589,6 +654,9 @@ impl<'a> ParseContext<'a> {
                 Rule::module_prefixed_call => {
                     return self.parse_module_prefixed_call(inner);
                 }
+                Rule::method_call => {
+                    return self.parse_method_call(inner);
+                }
                 Rule::local_call => {
                     return self.parse_local_call(inner);
                 }
@@ -631,6 +699,7 @@ impl<'a> ParseContext<'a> {
             module_prefix,
             name,
             vals,
+            receiver: None,
         }))
     }
 
@@ -657,7 +726,106 @@ impl<'a> ParseContext<'a> {
             module_prefix: None,
             name,
             vals,
+            receiver: None,
         }))
+    }
+
+    /// Parses a `method_call` node into a boxed [`ast::FnCall`].
+    ///
+    /// A method call has the form `receiver.method(args)` where the receiver
+    /// is an identifier optionally followed by non-method suffixes (index/field).
+    ///
+    /// # Arguments
+    /// * `pair` – the `method_call` parse-tree node.
+    fn parse_method_call(&self, pair: Pair) -> ParseResult<Box<ast::FnCall>> {
+        let pos = get_pos(&pair);
+        let inner_pairs: Vec<_> = pair.into_inner().collect();
+
+        // Collect: identifier, zero or more expr_suffix_no_method, dot (skipped), identifier, args
+        // Layout: ident [suffix]* dot ident lparen [right_val_list] rparen
+        // We skip dot/lparen/rparen as they are delimiter tokens not grammar rule nodes.
+        let mut base_id: Option<String> = None;
+        let mut suffixes: Vec<_> = Vec::new();
+        let mut method_name: Option<String> = None;
+        let mut vals = Vec::new();
+        let mut saw_method = false;
+
+        for inner in &inner_pairs {
+            match inner.as_rule() {
+                Rule::identifier if !saw_method => {
+                    if base_id.is_none() {
+                        base_id = Some(inner.as_str().to_string());
+                    } else {
+                        // Second identifier is the method name (after suffixes + dot)
+                        method_name = Some(inner.as_str().to_string());
+                        saw_method = true;
+                    }
+                }
+                Rule::expr_suffix_no_method if !saw_method => {
+                    suffixes.push(inner.clone());
+                }
+                Rule::right_val_list => {
+                    vals = self.parse_right_val_list(inner.clone())?;
+                }
+                _ => {}
+            }
+        }
+
+        // Build receiver LeftVal from base_id + suffixes
+        let base_id = base_id.unwrap_or_default();
+        let mut receiver = Box::new(ast::LeftVal {
+            pos,
+            inner: ast::LeftValInner::Id(base_id),
+        });
+        for suffix_pair in suffixes {
+            receiver = self.parse_expr_suffix_no_method(receiver, suffix_pair)?;
+        }
+
+        Ok(Box::new(ast::FnCall {
+            module_prefix: None,
+            name: method_name.unwrap_or_default(),
+            vals,
+            receiver: Some(receiver),
+        }))
+    }
+
+    /// Applies an `expr_suffix_no_method` to a receiver [`ast::LeftVal`].
+    ///
+    /// Supports array index (`[idx]`) and field access (`.field`) but not
+    /// method calls (handled separately).
+    fn parse_expr_suffix_no_method(
+        &self,
+        base: Box<ast::LeftVal>,
+        pair: Pair,
+    ) -> ParseResult<Box<ast::LeftVal>> {
+        let pos = base.pos;
+        for inner in pair.into_inner() {
+            match inner.as_rule() {
+                Rule::index_expr => {
+                    let idx = self.parse_index_expr(inner)?;
+                    return Ok(Box::new(ast::LeftVal {
+                        pos,
+                        inner: ast::LeftValInner::ArrayExpr(Box::new(ast::ArrayExpr {
+                            arr: base,
+                            idx,
+                        })),
+                    }));
+                }
+                Rule::identifier => {
+                    // Field access (.field without following "(")
+                    let member_id = inner.as_str().to_string();
+                    return Ok(Box::new(ast::LeftVal {
+                        pos,
+                        inner: ast::LeftValInner::MemberExpr(Box::new(ast::MemberExpr {
+                            struct_id: base,
+                            member_id,
+                        })),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(base)
     }
 
     /// Parses a `left_val` node into a boxed [`ast::LeftVal`].

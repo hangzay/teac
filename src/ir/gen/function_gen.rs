@@ -9,7 +9,7 @@
 use crate::ast::{self, ArrayInitializer, AssignmentStmt, RightValList};
 use crate::ir::function::{BlockLabel, FunctionGenerator};
 use crate::ir::gen::conversions::{compose_var_decl_dtype, compose_var_def_dtype};
-use crate::ir::stmt::{ArithBinOp, CmpPredicate, StmtInner};
+use crate::ir::stmt::{ArithBinOp, CmpPredicate, FloatBinOp, FloatCmpPredicate, StmtInner};
 use crate::ir::types::Dtype;
 use crate::ir::value::{Local, Operand};
 use crate::ir::Error;
@@ -56,6 +56,7 @@ impl FunctionGenerator<'_> {
 
         let arguments = function_type.arguments.clone();
         let return_dtype = function_type.return_dtype.clone();
+        self.current_return_dtype = Some(return_dtype.clone());
         // The entry label is the function's link name so that the IR's
         // entry-block label matches the `@symbol` emitted by the printer.
         let entry_label = self.resolve_link_name(identifier);
@@ -85,13 +86,14 @@ impl FunctionGenerator<'_> {
         }
 
         // Append an implicit return if the last instruction is not already a
-        // return.  `FunctionType::try_from` whitelists return types to
-        // Void/I32 at registration, so any other variant here would be a
+        // return. `FunctionType::try_from` whitelists return types to
+        // Void/I32/F32 at registration, so any other variant here would be a
         // broken invariant in the front-end.
         if let Some(stmt) = self.irs.last() {
             if !matches!(stmt.inner, StmtInner::Return(_)) {
                 match &return_dtype {
                     Dtype::I32 => self.emit_return(Some(Operand::from(0))),
+                    Dtype::F32 => self.emit_return(Some(Operand::from(0.0f32))),
                     Dtype::Void => self.emit_return(None),
                     other => unreachable!(
                         "function {} has return type {other} which \
@@ -131,6 +133,7 @@ impl FunctionGenerator<'_> {
             ast::CodeBlockStmtInner::Call(s) => self.handle_call_stmt(s),
             ast::CodeBlockStmtInner::If(s) => self.handle_if_stmt(s, con_label, bre_label),
             ast::CodeBlockStmtInner::While(s) => self.handle_while_stmt(s),
+            ast::CodeBlockStmtInner::For(s) => self.handle_for_stmt(s, con_label, bre_label),
             ast::CodeBlockStmtInner::Return(s) => self.handle_return_stmt(s),
             ast::CodeBlockStmtInner::Continue(_) => self.handle_continue_stmt(con_label),
             ast::CodeBlockStmtInner::Break(_) => self.handle_break_stmt(bre_label),
@@ -145,7 +148,9 @@ impl FunctionGenerator<'_> {
     /// single `store` instruction.
     pub fn handle_assignment_stmt(&mut self, stmt: &AssignmentStmt) -> Result<(), Error> {
         let left = self.handle_left_val(&stmt.left_val)?;
+        let target_dtype = Self::storage_value_dtype(&left);
         let right = self.handle_right_val(&stmt.right_val)?;
+        let right = self.coerce_operand(right, &target_dtype)?;
         self.emit_store(right, left);
         Ok(())
     }
@@ -155,11 +160,7 @@ impl FunctionGenerator<'_> {
     /// Records the identifier for scope-exit cleanup via [`record_scoped_local`].
     /// Returns `VariableRedefinition` if a variable with the same name already
     /// exists in the symbol table.
-    fn insert_scoped_local(
-        &mut self,
-        identifier: &str,
-        variable: Local,
-    ) -> Result<(), Error> {
+    fn insert_scoped_local(&mut self, identifier: &str, variable: Local) -> Result<(), Error> {
         if self
             .local_variables
             .insert(identifier.to_string(), variable)
@@ -180,6 +181,130 @@ impl FunctionGenerator<'_> {
         let local = self.fresh_local(Dtype::ptr_to(pointee));
         self.emit_alloca(Operand::from(&local));
         local
+    }
+
+    /// Returns the value type stored behind a pointer-like operand.
+    fn storage_value_dtype(ptr: &Operand) -> Dtype {
+        match ptr.dtype() {
+            Dtype::Pointer { pointee } => pointee.as_ref().clone(),
+            other => other.clone(),
+        }
+    }
+
+    /// Returns the element type for an array storage pointer, if known.
+    fn array_element_dtype(base_ptr: &Operand) -> Option<Dtype> {
+        match base_ptr.dtype() {
+            Dtype::Pointer { pointee } => match pointee.as_ref() {
+                Dtype::Array { element, .. } => Some(element.as_ref().clone()),
+                other => Some(other.clone()),
+            },
+            Dtype::Array { element, .. } => Some(element.as_ref().clone()),
+            _ => None,
+        }
+    }
+
+    /// Inserts the IR conversion needed to coerce an operand to `target`.
+    fn coerce_operand(&mut self, operand: Operand, target: &Dtype) -> Result<Operand, Error> {
+        if operand.dtype() == target {
+            return Ok(operand);
+        }
+
+        match (operand.dtype().clone(), target) {
+            (Dtype::I32, Dtype::F32) => {
+                let dst = Operand::from(self.fresh_local(Dtype::F32));
+                self.emit_sitofp(operand, dst.clone());
+                Ok(dst)
+            }
+            (Dtype::F32, Dtype::I32) => {
+                let dst = Operand::from(self.fresh_local(Dtype::I32));
+                self.emit_fptosi(operand, dst.clone());
+                Ok(dst)
+            }
+            (actual, expected) => Err(Error::TypeMismatch {
+                symbol: "conversion".to_string(),
+                expected: expected.clone(),
+                actual,
+            }),
+        }
+    }
+
+    /// Coerces arithmetic operands to a common numeric type.
+    fn coerce_numeric_pair(
+        &mut self,
+        left: Operand,
+        right: Operand,
+    ) -> Result<(Operand, Operand, Dtype), Error> {
+        let left_dtype = left.dtype().clone();
+        let right_dtype = right.dtype().clone();
+        match (&left_dtype, &right_dtype) {
+            (Dtype::F32, _) | (_, Dtype::F32) => {
+                let left = self.coerce_operand(left, &Dtype::F32)?;
+                let right = self.coerce_operand(right, &Dtype::F32)?;
+                Ok((left, right, Dtype::F32))
+            }
+            (Dtype::I32, Dtype::I32) => Ok((left, right, Dtype::I32)),
+            (actual, expected) => Err(Error::TypeMismatch {
+                symbol: "numeric expression".to_string(),
+                expected: (*expected).clone(),
+                actual: (*actual).clone(),
+            }),
+        }
+    }
+
+    /// Lowers a function call and optionally returns its result operand.
+    fn lower_fn_call(&mut self, fn_call: &ast::FnCall) -> Result<Option<Operand>, Error> {
+        let function_name = fn_call.qualified_name();
+        let function_type = self
+            .registry
+            .function_types
+            .get(&function_name)
+            .cloned()
+            .ok_or_else(|| Error::FunctionNotDefined {
+                symbol: function_name.clone(),
+            })?;
+
+        let mut args = Vec::new();
+        for (idx, arg) in fn_call.vals.iter().enumerate() {
+            let mut right_val = self.handle_right_val(arg)?;
+            if let Some((_, expected)) = function_type.arguments.get(idx) {
+                right_val = self.coerce_operand(right_val, expected)?;
+            }
+            args.push(right_val);
+        }
+
+        let retval = match &function_type.return_dtype {
+            Dtype::Void => None,
+            Dtype::I32 | Dtype::F32 => Some(Operand::from(
+                self.fresh_local(function_type.return_dtype.clone()),
+            )),
+            other => unreachable!(
+                "registered function {function_name} has return type {other} \
+                 which FunctionType::try_from should have rejected"
+            ),
+        };
+        let link_name = self.resolve_link_name(&function_name);
+        self.emit_call(link_name, retval.clone(), args);
+        Ok(retval)
+    }
+
+    /// Loads an addressable scalar operand into an SSA value.
+    fn load_scalar_operand(&mut self, operand: Operand) -> Operand {
+        match operand.dtype().clone() {
+            Dtype::Pointer { pointee }
+                if operand.is_addressable()
+                    && !matches!(pointee.as_ref(), Dtype::Array { .. } | Dtype::Struct { .. }) =>
+            {
+                let dst = Operand::from(self.fresh_local(pointee.as_ref().clone()));
+                self.emit_load(dst.clone(), operand);
+                dst
+            }
+            Dtype::I32 | Dtype::F32 if matches!(&operand, Operand::Global(_)) => {
+                let dst = Operand::from(self.fresh_local(operand.dtype().clone()));
+                self.emit_load(dst.clone(), operand);
+                dst
+            }
+            _ => operand,
+        }
     }
 
     /// Allocates stack space for a scalar local and initializes it with `right_val`.
@@ -244,11 +369,17 @@ impl FunctionGenerator<'_> {
     /// - `base_ptr`: operand pointing to the first element of the array.
     /// - `vals`: list of right-hand-side values to store sequentially.
     pub fn init_array(&mut self, base_ptr: &Operand, vals: &RightValList) -> Result<(), Error> {
+        let element_dtype = Self::array_element_dtype(base_ptr).unwrap_or(Dtype::I32);
         for (i, val) in vals.iter().enumerate() {
-            let element_ptr = Operand::from(self.fresh_local(Dtype::ptr_to(Dtype::I32)));
+            let element_ptr = Operand::from(self.fresh_local(Dtype::ptr_to(element_dtype.clone())));
             let right_elem = self.handle_right_val(val)?;
+            let right_elem = self.coerce_operand(right_elem, &element_dtype)?;
 
-            self.emit_gep(element_ptr.clone(), base_ptr.clone(), array_index_operand(i));
+            self.emit_gep(
+                element_ptr.clone(),
+                base_ptr.clone(),
+                array_index_operand(i),
+            );
             self.emit_store(right_elem, element_ptr);
         }
         Ok(())
@@ -267,10 +398,17 @@ impl FunctionGenerator<'_> {
         match initializer {
             ArrayInitializer::ExplicitList(vals) => self.init_array(base_ptr, vals),
             ArrayInitializer::Fill { val, count } => {
+                let element_dtype = Self::array_element_dtype(base_ptr).unwrap_or(Dtype::I32);
                 let fill_val = self.handle_right_val(val)?;
+                let fill_val = self.coerce_operand(fill_val, &element_dtype)?;
                 for i in 0..*count {
-                    let element_ptr = Operand::from(self.fresh_local(Dtype::ptr_to(Dtype::I32)));
-                    self.emit_gep(element_ptr.clone(), base_ptr.clone(), array_index_operand(i));
+                    let element_ptr =
+                        Operand::from(self.fresh_local(Dtype::ptr_to(element_dtype.clone())));
+                    self.emit_gep(
+                        element_ptr.clone(),
+                        base_ptr.clone(),
+                        array_index_operand(i),
+                    );
                     self.emit_store(fill_val.clone(), element_ptr);
                 }
                 Ok(())
@@ -290,6 +428,7 @@ impl FunctionGenerator<'_> {
         let variable: Local = match &def.inner {
             ast::VarDefInner::Scalar(scalar) => {
                 let right_val = self.handle_right_val(&scalar.val)?;
+                let right_val = self.coerce_operand(right_val, &pointee)?;
                 self.define_scalar_local(pointee, right_val)
             }
             ast::VarDefInner::Array(array) => {
@@ -307,34 +446,8 @@ impl FunctionGenerator<'_> {
     /// Evaluates each argument, allocates a temporary for a non-void return
     /// value (which is subsequently discarded), and emits the `call` instruction.
     pub fn handle_call_stmt(&mut self, stmt: &ast::CallStmt) -> Result<(), Error> {
-        let function_name = stmt.fn_call.qualified_name();
-        let mut args = Vec::new();
-        for arg in &stmt.fn_call.vals {
-            let right_val = self.handle_right_val(arg)?;
-            args.push(right_val);
-        }
-
-        match self.registry.function_types.get(&function_name) {
-            None => Err(Error::FunctionNotDefined {
-                symbol: function_name,
-            }),
-            Some(function_type) => {
-                // `FunctionType::try_from` whitelists return types to Void/I32
-                // at registration; any other variant here would indicate a
-                // broken invariant in the front-end.
-                let retval = match &function_type.return_dtype {
-                    Dtype::Void => None,
-                    Dtype::I32 => Some(Operand::from(self.fresh_local(Dtype::I32))),
-                    other => unreachable!(
-                        "registered function {function_name} has return type {other} \
-                         which FunctionType::try_from should have rejected"
-                    ),
-                };
-                let link_name = self.resolve_link_name(&function_name);
-                self.emit_call(link_name, retval, args);
-                Ok(())
-            }
-        }
+        self.lower_fn_call(&stmt.fn_call)?;
+        Ok(())
     }
 
     /// Lowers an `if` / `else` statement into branching IR.
@@ -421,6 +534,88 @@ impl FunctionGenerator<'_> {
         Ok(())
     }
 
+    /// Lowers one side of a `for i in start..end` range to an i32 value.
+    fn handle_range_bound(&mut self, bound: &ast::RangeBound) -> Result<Operand, Error> {
+        let value = match &bound.inner {
+            ast::RangeBoundInner::ArithExpr(expr) => self.handle_arith_expr(expr)?,
+            ast::RangeBoundInner::FnCall(fn_call) => {
+                self.lower_fn_call(fn_call)?
+                    .ok_or_else(|| Error::InvalidExprUnit {
+                        expr_unit: ast::ExprUnit {
+                            pos: bound.pos,
+                            inner: ast::ExprUnitInner::FnCall(fn_call.clone()),
+                        },
+                    })?
+            }
+            ast::RangeBoundInner::Num(num) => Operand::from(*num),
+            ast::RangeBoundInner::Id(id) => {
+                let operand = self.lookup_variable(id)?;
+                self.load_scalar_operand(operand)
+            }
+        };
+        self.coerce_operand(value, &Dtype::I32)
+    }
+
+    /// Lowers a `for` loop statement.
+    pub fn handle_for_stmt(
+        &mut self,
+        stmt: &ast::ForStmt,
+        _con_label: Option<&BlockLabel>,
+        _bre_label: Option<&BlockLabel>,
+    ) -> Result<(), Error> {
+        let start = self.handle_range_bound(&stmt.start)?;
+        let end = self.handle_range_bound(&stmt.end)?;
+
+        let test_label = self.alloc_basic_block();
+        let body_label = self.alloc_basic_block();
+        let step_label = self.alloc_basic_block();
+        let exit_label = self.alloc_basic_block();
+
+        self.enter_scope();
+        let iter_slot = self.allocate_pointer_local(Dtype::I32);
+        self.insert_scoped_local(&stmt.iterator, iter_slot.clone())?;
+        self.emit_store(start, Operand::from(&iter_slot));
+
+        let end_slot = self.allocate_pointer_local(Dtype::I32);
+        self.emit_store(end, Operand::from(&end_slot));
+
+        self.emit_jump(test_label.clone());
+
+        self.emit_label(test_label.clone());
+        let iter_val = Operand::from(self.fresh_local(Dtype::I32));
+        self.emit_load(iter_val.clone(), Operand::from(&iter_slot));
+        let end_val = Operand::from(self.fresh_local(Dtype::I32));
+        self.emit_load(end_val.clone(), Operand::from(&end_slot));
+        let cond = Operand::from(self.fresh_local(Dtype::I1));
+        self.emit_cmp(CmpPredicate::Slt, iter_val, end_val, cond.clone());
+        self.emit_cjump(cond, body_label.clone(), exit_label.clone());
+
+        self.emit_label(body_label);
+        self.enter_scope();
+        for s in &stmt.stmts {
+            self.handle_block(s, Some(&step_label), Some(&exit_label))?;
+        }
+        self.exit_scope();
+        self.emit_jump(step_label.clone());
+
+        self.emit_label(step_label.clone());
+        let iter_current = Operand::from(self.fresh_local(Dtype::I32));
+        self.emit_load(iter_current.clone(), Operand::from(&iter_slot));
+        let iter_next = Operand::from(self.fresh_local(Dtype::I32));
+        self.emit_biop(
+            ArithBinOp::Add,
+            iter_current,
+            Operand::from(1),
+            iter_next.clone(),
+        );
+        self.emit_store(iter_next, Operand::from(&iter_slot));
+        self.emit_jump(test_label);
+
+        self.emit_label(exit_label);
+        self.exit_scope();
+        Ok(())
+    }
+
     /// Lowers a `return` statement.
     ///
     /// Emits a void `return` when no value is present, or evaluates the return
@@ -432,6 +627,11 @@ impl FunctionGenerator<'_> {
             }
             Some(val) => {
                 let val = self.handle_right_val(val)?;
+                let val = if let Some(target) = self.current_return_dtype.clone() {
+                    self.coerce_operand(val, &target)?
+                } else {
+                    val
+                };
                 self.emit_return(Some(val));
             }
         }
@@ -474,14 +674,14 @@ impl FunctionGenerator<'_> {
     ) -> Result<(), Error> {
         let left = self.handle_expr_unit(&expr.left)?;
         let right = self.handle_expr_unit(&expr.right)?;
+        let (left, right, dtype) = self.coerce_numeric_pair(left, right)?;
 
         let dst = Operand::from(self.fresh_local(Dtype::I1));
-        self.emit_cmp(
-            CmpPredicate::from(&expr.op),
-            left,
-            right,
-            dst.clone(),
-        );
+        if matches!(dtype, Dtype::F32) {
+            self.emit_fcmp(FloatCmpPredicate::from(&expr.op), left, right, dst.clone());
+        } else {
+            self.emit_cmp(CmpPredicate::from(&expr.op), left, right, dst.clone());
+        }
         self.emit_cjump(dst, true_label, false_label);
 
         Ok(())
@@ -509,67 +709,25 @@ impl FunctionGenerator<'_> {
             }
             ast::ExprUnitInner::ArithExpr(expr) => self.handle_arith_expr(expr),
             ast::ExprUnitInner::FnCall(fn_call) => {
-                let name = fn_call.qualified_name();
-                let return_dtype = &self
-                    .registry
-                    .function_types
-                    .get(&name)
+                self.lower_fn_call(fn_call)?
                     .ok_or_else(|| Error::InvalidExprUnit {
                         expr_unit: unit.clone(),
-                    })?
-                    .return_dtype;
-
-                // `FunctionType::try_from` whitelists return types to Void/I32.
-                // In expression position, only I32 is usable; a void call in
-                // an expression is a source-level mistake.
-                let res = match return_dtype {
-                    Dtype::I32 => Operand::from(self.fresh_local(Dtype::I32)),
-                    Dtype::Void => {
-                        return Err(Error::InvalidExprUnit {
-                            expr_unit: unit.clone(),
-                        });
-                    }
-                    other => unreachable!(
-                        "registered function {name} has return type {other} \
-                         which FunctionType::try_from should have rejected"
-                    ),
-                };
-
-                let mut args: Vec<Operand> = Vec::new();
-                for arg in &fn_call.vals {
-                    let rval = self.handle_right_val(arg)?;
-                    args.push(rval);
-                }
-                let link_name = self.resolve_link_name(&name);
-                self.emit_call(link_name, Some(res.clone()), args);
-
-                Ok(res)
+                    })
             }
             ast::ExprUnitInner::ArrayExpr(expr) => self.handle_array_expr(expr),
             ast::ExprUnitInner::MemberExpr(expr) => self.handle_member_expr(expr),
             ast::ExprUnitInner::Reference(id) => {
                 return self.handle_reference_expr(id);
             }
+            ast::ExprUnitInner::FloatNum(num) => Ok(Operand::from(*num)),
+            ast::ExprUnitInner::Cast(cast) => {
+                let value = self.handle_expr_unit(&cast.expr)?;
+                let target = Dtype::from(&cast.target_type);
+                self.coerce_operand(value, &target)
+            }
         }?;
 
-        Ok(match operand.dtype() {
-            // Auto-load: dereference addressable scalar pointers (but leave arrays/structs as-is).
-            Dtype::Pointer { pointee }
-                if operand.is_addressable()
-                    && !matches!(pointee.as_ref(), Dtype::Array { .. } | Dtype::Struct { .. }) =>
-            {
-                let dst = Operand::from(self.fresh_local(pointee.as_ref().clone()));
-                self.emit_load(dst.clone(), operand);
-                dst
-            }
-            // Auto-load global i32 values which are stored behind a pointer.
-            Dtype::I32 if matches!(&operand, Operand::Global(_)) => {
-                let dst = Operand::from(self.fresh_local(Dtype::I32));
-                self.emit_load(dst.clone(), operand);
-                dst
-            }
-            _ => operand,
-        })
+        Ok(self.load_scalar_operand(operand))
     }
 
     /// Lowers a reference expression (`&id`) to a pointer to the array's first element.
@@ -604,10 +762,39 @@ impl FunctionGenerator<'_> {
 
     /// Lowers an arithmetic expression (binary operation or a single unit).
     fn handle_arith_expr(&mut self, expr: &ast::ArithExpr) -> Result<Operand, Error> {
-        match &expr.inner {
-            ast::ArithExprInner::ArithBiOpExpr(expr) => self.handle_arith_biop_expr(expr),
-            ast::ArithExprInner::ExprUnit(unit) => self.handle_expr_unit(unit),
+        enum Frame<'a> {
+            Expr(&'a ast::ArithExpr),
+            Apply(&'a ast::ArithBiOp),
         }
+
+        let mut frames = vec![Frame::Expr(expr)];
+        let mut operands = Vec::new();
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Expr(expr) => match &expr.inner {
+                    ast::ArithExprInner::ArithBiOpExpr(biop) => {
+                        frames.push(Frame::Apply(&biop.op));
+                        frames.push(Frame::Expr(&biop.right));
+                        frames.push(Frame::Expr(&biop.left));
+                    }
+                    ast::ArithExprInner::ExprUnit(unit) => {
+                        operands.push(self.handle_expr_unit(unit)?);
+                    }
+                },
+                Frame::Apply(op) => {
+                    let right = operands.pop().expect("missing right arithmetic operand");
+                    let left = operands.pop().expect("missing left arithmetic operand");
+                    operands.push(self.emit_numeric_biop(op, left, right)?);
+                }
+            }
+        }
+
+        operands.pop().ok_or_else(|| Error::InvalidExprUnit {
+            expr_unit: ast::ExprUnit {
+                pos: expr.pos,
+                inner: ast::ExprUnitInner::ArithExpr(Box::new(expr.clone())),
+            },
+        })
     }
 
     /// Lowers a right-hand-side value (arithmetic or boolean expression) to an [`Operand`].
@@ -681,14 +868,11 @@ impl FunctionGenerator<'_> {
             .map(|elem| &elem.1)
             .ok_or_else(|| Error::InvalidStructMemberExpression { expr: expr.clone() })?;
         let member_dtype = member.dtype.clone();
-        let member_index = i32::try_from(member.index).map_err(|_| {
-            Error::InvalidStructMemberExpression { expr: expr.clone() }
-        })?;
+        let member_index = i32::try_from(member.index)
+            .map_err(|_| Error::InvalidStructMemberExpression { expr: expr.clone() })?;
 
         let target = match &member_dtype {
-            Dtype::Void => {
-                return Err(Error::InvalidStructMemberExpression { expr: expr.clone() })
-            }
+            Dtype::Void => return Err(Error::InvalidStructMemberExpression { expr: expr.clone() }),
             _ => Operand::from(self.fresh_local(Dtype::ptr_to(member_dtype))),
         };
 
@@ -708,12 +892,20 @@ impl FunctionGenerator<'_> {
         }
     }
 
-    /// Lowers a binary arithmetic expression (`left op right`) to an `i32` temporary.
-    fn handle_arith_biop_expr(&mut self, expr: &ast::ArithBiOpExpr) -> Result<Operand, Error> {
-        let left = self.handle_arith_expr(&expr.left)?;
-        let right = self.handle_arith_expr(&expr.right)?;
-        let dst = Operand::from(self.fresh_local(Dtype::I32));
-        self.emit_biop(ArithBinOp::from(&expr.op), left, right, dst.clone());
+    /// Emits a numeric binary operation after applying integer/float promotion.
+    fn emit_numeric_biop(
+        &mut self,
+        op: &ast::ArithBiOp,
+        left: Operand,
+        right: Operand,
+    ) -> Result<Operand, Error> {
+        let (left, right, dtype) = self.coerce_numeric_pair(left, right)?;
+        let dst = Operand::from(self.fresh_local(dtype.clone()));
+        if matches!(dtype, Dtype::F32) {
+            self.emit_fbiop(FloatBinOp::from(op), left, right, dst.clone());
+        } else {
+            self.emit_biop(ArithBinOp::from(op), left, right, dst.clone());
+        }
         Ok(dst)
     }
 

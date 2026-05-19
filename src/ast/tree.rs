@@ -99,9 +99,34 @@ impl DisplayAsTree for ProgramElement {
         match &self.inner {
             ProgramElementInner::VarDeclStmt(v) => v.fmt_tree(f, indent_levels, is_last),
             ProgramElementInner::StructDef(s) => s.fmt_tree(f, indent_levels, is_last),
+            ProgramElementInner::ImplDef(i) => i.fmt_tree(f, indent_levels, is_last),
             ProgramElementInner::FnDeclStmt(d) => d.fmt_tree(f, indent_levels, is_last),
             ProgramElementInner::FnDef(def) => def.fmt_tree(f, indent_levels, is_last),
         }
+    }
+}
+
+/// Prints `ImplDef <name>` then lists each method definition as a child.
+impl DisplayAsTree for ImplDef {
+    fn fmt_tree(
+        &self,
+        f: &mut Formatter<'_>,
+        indent_levels: &[bool],
+        is_last: bool,
+    ) -> Result<(), Error> {
+        writeln!(
+            f,
+            "{}ImplDef {}",
+            tree_indent(indent_levels, is_last),
+            self.name
+        )?;
+        let mut new_indent = indent_levels.to_vec();
+        new_indent.push(is_last);
+        let last_index = self.methods.len().saturating_sub(1);
+        for (i, method) in self.methods.iter().enumerate() {
+            method.fmt_tree(f, &new_indent, i == last_index)?;
+        }
+        Ok(())
     }
 }
 
@@ -314,7 +339,8 @@ impl DisplayAsTree for AssignmentStmt {
     }
 }
 
-/// Prints `CallStmt <fn_name>` then lists each argument as a child.
+/// Prints `CallStmt <fn_name>` (or `MethodCallStmt <receiver>.<name>`) then
+/// lists each argument as a child.
 impl DisplayAsTree for CallStmt {
     fn fmt_tree(
         &self,
@@ -322,12 +348,22 @@ impl DisplayAsTree for CallStmt {
         indent_levels: &[bool],
         is_last: bool,
     ) -> Result<(), Error> {
-        writeln!(
-            f,
-            "{}CallStmt {}",
-            tree_indent(indent_levels, is_last),
-            self.fn_call.name
-        )?;
+        if let Some(receiver) = &self.fn_call.receiver {
+            writeln!(
+                f,
+                "{}MethodCallStmt {}.{}",
+                tree_indent(indent_levels, is_last),
+                receiver,
+                self.fn_call.name
+            )?;
+        } else {
+            writeln!(
+                f,
+                "{}CallStmt {}",
+                tree_indent(indent_levels, is_last),
+                self.fn_call.name
+            )?;
+        }
 
         let mut new_indent = indent_levels.to_vec();
         new_indent.push(is_last);
@@ -354,6 +390,7 @@ impl DisplayAsTree for CodeBlockStmtInner {
             CodeBlockStmtInner::Call(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
             CodeBlockStmtInner::If(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
             CodeBlockStmtInner::While(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
+            CodeBlockStmtInner::For(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
             CodeBlockStmtInner::Return(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
             CodeBlockStmtInner::Continue(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
             CodeBlockStmtInner::Break(stmt) => stmt.fmt_tree(f, indent_levels, is_last),
@@ -417,6 +454,33 @@ impl DisplayAsTree for IfStmt {
             e.fmt_tree(f, &new_indent, true)?;
         }
         Ok(())
+    }
+}
+
+/// Prints `ForStmt <iter> in <start>..<end>` then shows the loop body.
+impl DisplayAsTree for ForStmt {
+    fn fmt_tree(
+        &self,
+        f: &mut Formatter<'_>,
+        indent_levels: &[bool],
+        is_last: bool,
+    ) -> Result<(), Error> {
+        writeln!(
+            f,
+            "{}ForStmt {} in {}..{}",
+            tree_indent(indent_levels, is_last),
+            self.iterator,
+            self.start,
+            self.end,
+        )?;
+        let mut new_indent = indent_levels.to_vec();
+        new_indent.push(is_last);
+        writeln!(
+            f,
+            "{}Body:",
+            tree_indent(&new_indent, self.stmts.is_empty())
+        )?;
+        self.stmts.fmt_tree(f, &new_indent, true)
     }
 }
 
@@ -696,6 +760,9 @@ impl DisplayAsTree for ExprUnit {
         new_indent.push(is_last);
         match &self.inner {
             ExprUnitInner::Num(n) => writeln!(f, "{}Num({})", tree_indent(&new_indent, true), n),
+            ExprUnitInner::FloatNum(n) => {
+                writeln!(f, "{}FloatNum({})", tree_indent(&new_indent, true), n)
+            }
             ExprUnitInner::Id(id) => writeln!(f, "{}Id({})", tree_indent(&new_indent, true), id),
             ExprUnitInner::ArithExpr(ae) => ae.fmt_tree(f, &new_indent, true),
             ExprUnitInner::FnCall(fc) => fc.fmt_tree(f, &new_indent, true),
@@ -703,6 +770,15 @@ impl DisplayAsTree for ExprUnit {
             ExprUnitInner::MemberExpr(me) => me.fmt_tree(f, &new_indent, true),
             ExprUnitInner::Reference(id) => {
                 writeln!(f, "{}Ref({})", tree_indent(&new_indent, true), id)
+            }
+            ExprUnitInner::Cast(c) => {
+                writeln!(
+                    f,
+                    "{}Cast({} as {})",
+                    tree_indent(&new_indent, true),
+                    c.expr,
+                    c.target_type
+                )
             }
         }
     }
@@ -751,7 +827,8 @@ impl DisplayAsTree for BoolUnit {
     }
 }
 
-/// Prints `FnCall: <qualified_name>` then lists each argument as a child.
+/// Prints `FnCall: <qualified_name>` (or `MethodCall: <receiver>.<name>`) then
+/// lists each argument as a child.
 impl DisplayAsTree for FnCall {
     fn fmt_tree(
         &self,
@@ -759,14 +836,23 @@ impl DisplayAsTree for FnCall {
         indent_levels: &[bool],
         is_last: bool,
     ) -> Result<(), Error> {
-        // Use the qualified name so that module-prefixed calls are shown correctly.
-        let fn_name = self.qualified_name();
-        writeln!(
-            f,
-            "{}FnCall: {}",
-            tree_indent(indent_levels, is_last),
-            fn_name
-        )?;
+        if let Some(receiver) = &self.receiver {
+            writeln!(
+                f,
+                "{}MethodCall: {}.{}",
+                tree_indent(indent_levels, is_last),
+                receiver,
+                self.name
+            )?;
+        } else {
+            let fn_name = self.qualified_name();
+            writeln!(
+                f,
+                "{}FnCall: {}",
+                tree_indent(indent_levels, is_last),
+                fn_name
+            )?;
+        }
         let mut new_indent = indent_levels.to_vec();
         new_indent.push(is_last);
 

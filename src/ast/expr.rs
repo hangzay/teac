@@ -6,7 +6,7 @@
 //! general-purpose expression units that glue everything together.
 
 use super::ops::*;
-use super::types::Pos;
+use super::types::{Pos, TypeSpecifier};
 
 /// An lvalue — a memory location that can appear on the left side of an
 /// assignment.
@@ -163,15 +163,17 @@ pub struct BoolUnit {
     pub inner: BoolUnitInner,
 }
 
-/// A function call expression, e.g. `foo(a, b)` or `mod::foo(a, b)`.
+/// A function call expression, e.g. `foo(a, b)` or `mod::foo(a, b)` or `obj.method(a)`.
 #[derive(Debug, Clone)]
 pub struct FnCall {
     /// Optional module prefix for qualified calls such as `io::print`.
     pub module_prefix: Option<String>,
-    /// The unqualified function name.
+    /// The unqualified function name (or method name for method calls).
     pub name: String,
     /// The list of argument values passed to the function.
     pub vals: RightValList,
+    /// Optional receiver lvalue for method calls, e.g. `c[0]` in `c[0].get()`.
+    pub receiver: Option<Box<LeftVal>>,
 }
 
 /// Implementation of helper methods for function calls.
@@ -181,7 +183,6 @@ impl FnCall {
     /// name otherwise (e.g., `"print"`).
     pub fn qualified_name(&self) -> String {
         if let Some(module) = &self.module_prefix {
-            // Combine module prefix and function name with `::` separator.
             format!("{module}::{}", self.name)
         } else {
             self.name.clone()
@@ -189,11 +190,22 @@ impl FnCall {
     }
 }
 
+/// A type-cast expression, e.g. `x as f32` or `arr[i] as i32`.
+#[derive(Debug, Clone)]
+pub struct CastExpr {
+    /// The expression being cast.
+    pub expr: Box<ExprUnit>,
+    /// The target type of the cast.
+    pub target_type: TypeSpecifier,
+}
+
 /// The inner representation of a leaf expression unit.
 #[derive(Debug, Clone)]
 pub enum ExprUnitInner {
     /// An integer literal.
     Num(i32),
+    /// A floating-point literal.
+    FloatNum(f32),
     /// A simple variable identifier.
     Id(String),
     /// A parenthesised arithmetic sub-expression.
@@ -206,6 +218,8 @@ pub enum ExprUnitInner {
     MemberExpr(Box<MemberExpr>),
     /// A reference to a variable, e.g. `&x`.
     Reference(String),
+    /// A type-cast expression, e.g. `x as f32`.
+    Cast(Box<CastExpr>),
 }
 
 /// An expression unit — the leaf node of arithmetic expressions — paired

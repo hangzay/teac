@@ -285,7 +285,7 @@ fn unify(uf: &mut UnionFind, a: &Ty, b: &Ty, symbol: &str) -> Result<(), Error> 
 ///   type but nothing in the program pins it to a concrete type (e.g. a
 ///   function whose body only calls itself).
 /// - [`Error::UnsupportedReturnType`] — inference produced a type other
-///   than `void` or `i32`; the backend does not support those yet.
+///   than `void`, `i32`, or `f32`; the backend does not support those yet.
 pub(crate) fn resolve_return_types(
     registry: &mut Registry,
     elements: &[ast::ProgramElement],
@@ -329,7 +329,7 @@ pub(crate) fn resolve_return_types(
     for (name, type_id) in pending_returns {
         let dtype = uf.resolve(type_id).unwrap_or(Dtype::Void);
         match &dtype {
-            Dtype::Void | Dtype::I32 => {}
+            Dtype::Void | Dtype::I32 | Dtype::F32 => {}
             _ => {
                 return Err(Error::UnsupportedReturnType {
                     symbol: name,
@@ -444,6 +444,7 @@ impl Collector<'_> {
             ast::CodeBlockStmtInner::Assignment(s) => self.process_assignment(s),
             ast::CodeBlockStmtInner::If(s) => self.process_if(s),
             ast::CodeBlockStmtInner::While(s) => self.process_while(s),
+            ast::CodeBlockStmtInner::For(s) => self.process_for(s),
             ast::CodeBlockStmtInner::Call(s) => {
                 self.type_of_fn_call(&s.fn_call)?;
                 Ok(())
@@ -616,6 +617,21 @@ impl Collector<'_> {
         self.merge_with_body(&body_env)
     }
 
+    fn process_for(&mut self, stmt: &ast::ForStmt) -> Result<(), Error> {
+        self.type_of_range_bound(&stmt.start)?;
+        self.type_of_range_bound(&stmt.end)?;
+
+        let mut body_ctx = self.fork(self.env.clone());
+        body_ctx
+            .env
+            .insert(stmt.iterator.clone(), Ty::concrete(Dtype::I32));
+        body_ctx.process_stmts(&stmt.stmts)?;
+        body_ctx.env.remove(&stmt.iterator);
+        let body_env = body_ctx.env;
+
+        self.merge_with_body(&body_env)
+    }
+
     /// Unify the two branch environments back into `self.env`.
     ///
     /// Algorithm:
@@ -716,29 +732,79 @@ impl Collector<'_> {
     }
 
     fn type_of_arith_expr(&mut self, expr: &ast::ArithExpr) -> Result<Ty, Error> {
-        match &expr.inner {
-            ast::ArithExprInner::ArithBiOpExpr(biop) => {
-                self.type_of_arith_expr(&biop.left)?;
-                self.type_of_arith_expr(&biop.right)?;
-                // Arithmetic in TeaLang is always i32 -> i32 -> i32.  The
-                // recursive walks let a pending-function call inside the
-                // operands unify its α against i32.
-                Ok(Ty::concrete(Dtype::I32))
-            }
-            ast::ArithExprInner::ExprUnit(unit) => self.type_of_expr_unit(unit),
+        enum Frame<'a> {
+            Expr(&'a ast::ArithExpr),
+            Combine,
         }
+
+        let mut frames = vec![Frame::Expr(expr)];
+        let mut values = Vec::new();
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Expr(expr) => match &expr.inner {
+                    ast::ArithExprInner::ArithBiOpExpr(biop) => {
+                        frames.push(Frame::Combine);
+                        frames.push(Frame::Expr(&biop.right));
+                        frames.push(Frame::Expr(&biop.left));
+                    }
+                    ast::ArithExprInner::ExprUnit(unit) => {
+                        values.push(self.type_of_expr_unit(unit)?);
+                    }
+                },
+                Frame::Combine => {
+                    let right = values.pop().expect("missing right operand type");
+                    let left = values.pop().expect("missing left operand type");
+                    values.push(self.numeric_result_ty(&left, &right, "arithmetic")?);
+                }
+            }
+        }
+
+        Ok(values.pop().unwrap_or_else(|| Ty::concrete(Dtype::I32)))
     }
 
     fn type_of_expr_unit(&mut self, unit: &ast::ExprUnit) -> Result<Ty, Error> {
         match &unit.inner {
             ast::ExprUnitInner::Num(_) => Ok(Ty::concrete(Dtype::I32)),
+            ast::ExprUnitInner::FloatNum(_) => Ok(Ty::concrete(Dtype::F32)),
             ast::ExprUnitInner::Id(id) => self.resolve_variable(id),
             ast::ExprUnitInner::ArithExpr(expr) => self.type_of_arith_expr(expr),
             ast::ExprUnitInner::FnCall(call) => self.type_of_fn_call(call),
             ast::ExprUnitInner::ArrayExpr(expr) => self.type_of_array_expr(expr),
             ast::ExprUnitInner::MemberExpr(expr) => self.type_of_member_expr(expr),
             ast::ExprUnitInner::Reference(id) => self.type_of_reference(id),
+            ast::ExprUnitInner::Cast(cast) => {
+                self.type_of_expr_unit(&cast.expr)?;
+                Ok(Ty::concrete(Dtype::from(&cast.target_type)))
+            }
         }
+    }
+
+    fn type_of_range_bound(&mut self, bound: &ast::RangeBound) -> Result<Ty, Error> {
+        match &bound.inner {
+            ast::RangeBoundInner::ArithExpr(expr) => self.type_of_arith_expr(expr),
+            ast::RangeBoundInner::FnCall(call) => self.type_of_fn_call(call),
+            ast::RangeBoundInner::Num(_) => Ok(Ty::concrete(Dtype::I32)),
+            ast::RangeBoundInner::Id(id) => self.resolve_variable(id),
+        }
+    }
+
+    fn numeric_result_ty(&mut self, left: &Ty, right: &Ty, symbol: &str) -> Result<Ty, Error> {
+        let has_float =
+            matches!(left, Ty::Concrete(Dtype::F32)) || matches!(right, Ty::Concrete(Dtype::F32));
+
+        if has_float {
+            if matches!(left, Ty::Var(_)) {
+                unify(self.uf, left, &Ty::concrete(Dtype::F32), symbol)?;
+            }
+            if matches!(right, Ty::Var(_)) {
+                unify(self.uf, right, &Ty::concrete(Dtype::F32), symbol)?;
+            }
+            return Ok(Ty::concrete(Dtype::F32));
+        }
+
+        unify(self.uf, left, &Ty::concrete(Dtype::I32), symbol)?;
+        unify(self.uf, right, &Ty::concrete(Dtype::I32), symbol)?;
+        Ok(Ty::concrete(Dtype::I32))
     }
 
     /// Look up `id` through the local env → globals chain.  The result

@@ -163,6 +163,7 @@ impl TypeInference<'_> {
             ast::CodeBlockStmtInner::Assignment(s) => self.process_assignment(s),
             ast::CodeBlockStmtInner::If(s) => self.process_if(s),
             ast::CodeBlockStmtInner::While(s) => self.process_while(s),
+            ast::CodeBlockStmtInner::For(s) => self.process_for(s),
             ast::CodeBlockStmtInner::Call(s) => self.check_call_args(&s.fn_call),
             ast::CodeBlockStmtInner::Return(s) => self.process_return(s),
             ast::CodeBlockStmtInner::Continue(_)
@@ -329,6 +330,26 @@ impl TypeInference<'_> {
         Ok(())
     }
 
+    /// For loops evaluate integer range bounds and expose the iterator as an
+    /// i32 local only inside the loop body.
+    fn process_for(&mut self, stmt: &ast::ForStmt) -> Result<(), Error> {
+        let start = self.type_of_range_bound(&stmt.start)?;
+        let end = self.type_of_range_bound(&stmt.end)?;
+        Self::check_compatible("for range start", &Dtype::I32, &start)?;
+        Self::check_compatible("for range end", &Dtype::I32, &end)?;
+
+        let mut body_ctx = self.fork(self.env.clone());
+        body_ctx
+            .env
+            .insert(stmt.iterator.clone(), VarState::Resolved(Dtype::I32));
+        body_ctx.process_stmts(&stmt.stmts)?;
+        body_ctx.env.remove(&stmt.iterator);
+        let body_env = body_ctx.env;
+
+        self.merge_env_single(&body_env)?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Return
     // -----------------------------------------------------------------------
@@ -416,26 +437,64 @@ impl TypeInference<'_> {
 
     /// Compute the type of an arithmetic expression.
     fn type_of_arith_expr(&self, expr: &ast::ArithExpr) -> Result<Dtype, Error> {
-        match &expr.inner {
-            ast::ArithExprInner::ArithBiOpExpr(biop) => {
-                self.type_of_arith_expr(&biop.left)?;
-                self.type_of_arith_expr(&biop.right)?;
-                Ok(Dtype::I32)
-            }
-            ast::ArithExprInner::ExprUnit(unit) => self.type_of_expr_unit(unit),
+        enum Frame<'a> {
+            Expr(&'a ast::ArithExpr),
+            Combine,
         }
+
+        let mut frames = vec![Frame::Expr(expr)];
+        let mut values = Vec::new();
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Expr(expr) => match &expr.inner {
+                    ast::ArithExprInner::ArithBiOpExpr(biop) => {
+                        frames.push(Frame::Combine);
+                        frames.push(Frame::Expr(&biop.right));
+                        frames.push(Frame::Expr(&biop.left));
+                    }
+                    ast::ArithExprInner::ExprUnit(unit) => {
+                        values.push(self.type_of_expr_unit(unit)?);
+                    }
+                },
+                Frame::Combine => {
+                    let right = values.pop().expect("missing right operand type");
+                    let left = values.pop().expect("missing left operand type");
+                    if matches!(left, Dtype::F32) || matches!(right, Dtype::F32) {
+                        values.push(Dtype::F32);
+                    } else {
+                        values.push(Dtype::I32);
+                    }
+                }
+            }
+        }
+
+        Ok(values.pop().unwrap_or(Dtype::I32))
     }
 
     /// Compute the type of a leaf expression unit.
     fn type_of_expr_unit(&self, unit: &ast::ExprUnit) -> Result<Dtype, Error> {
         match &unit.inner {
             ast::ExprUnitInner::Num(_) => Ok(Dtype::I32),
+            ast::ExprUnitInner::FloatNum(_) => Ok(Dtype::F32),
             ast::ExprUnitInner::Id(id) => self.resolve_variable(id),
             ast::ExprUnitInner::ArithExpr(expr) => self.type_of_arith_expr(expr),
             ast::ExprUnitInner::FnCall(call) => self.type_of_fn_call(call),
             ast::ExprUnitInner::ArrayExpr(expr) => self.type_of_array_expr(expr),
             ast::ExprUnitInner::MemberExpr(expr) => self.type_of_member_expr(expr),
             ast::ExprUnitInner::Reference(id) => self.type_of_reference(id),
+            ast::ExprUnitInner::Cast(cast) => {
+                self.type_of_expr_unit(&cast.expr)?;
+                Ok(Dtype::from(&cast.target_type))
+            }
+        }
+    }
+
+    fn type_of_range_bound(&self, bound: &ast::RangeBound) -> Result<Dtype, Error> {
+        match &bound.inner {
+            ast::RangeBoundInner::ArithExpr(expr) => self.type_of_arith_expr(expr),
+            ast::RangeBoundInner::FnCall(call) => self.type_of_fn_call(call),
+            ast::RangeBoundInner::Num(_) => Ok(Dtype::I32),
+            ast::RangeBoundInner::Id(id) => self.resolve_variable(id),
         }
     }
 
@@ -630,6 +689,12 @@ impl TypeInference<'_> {
 
     fn check_compatible(symbol: &str, expected: &Dtype, actual: &Dtype) -> Result<(), Error> {
         if expected == actual {
+            return Ok(());
+        }
+        if matches!(
+            (expected, actual),
+            (Dtype::I32, Dtype::F32) | (Dtype::F32, Dtype::I32)
+        ) {
             return Ok(());
         }
         Err(Error::TypeMismatch {
