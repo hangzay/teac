@@ -47,7 +47,9 @@
 //! 3. **Resolve**.  For every `(name, α_f)` in `pending_returns`, query
 //!    the union-find for the concrete type of `α_f` and write it back
 //!    to `registry.function_types[name].return_dtype`.  Unresolved
-//!    variables and non-`void`/`i32` resolutions are errors.
+//!    variables fall back to `void`; unsupported resolutions are errors.
+//!    In the combined assignment branch this pass accepts `void`, `i32`,
+//!    and `f32`, because assign3 adds `f32` to the IR type system.
 //!
 //! Steps 2 and 3 use a single shared [`UnionFind`]: constraints from one
 //! function's body can resolve the return type of another — that is the
@@ -162,9 +164,14 @@ impl UnionFind {
     ///
     /// See `docs/asmt-2.md` §3.2 (核心不变式) and §3.3 (工作示例).
     fn bind(&mut self, x: TypeId, dtype: Dtype, symbol: &str) -> Result<(), Error> {
+        // asmt-2 TODO 1: bind the equivalence class root, not the raw
+        // variable id.  After previous unions, `x` may already point to
+        // another representative, and only the root's concrete slot is live.
         let root = self.find(x);
         match &self.concrete[root] {
             None => {
+                // First concrete observation for this class, e.g.
+                // `return 1;` pins α_f to i32.
                 self.concrete[root] = Some(dtype);
                 Ok(())
             }
@@ -194,12 +201,17 @@ impl UnionFind {
     /// exactly the "one side concrete, the other empty" row; the `bind`
     /// conflict at the end demonstrates the last row in miniature.
     fn union(&mut self, a: TypeId, b: TypeId, symbol: &str) -> Result<(), Error> {
+        // asmt-2 TODO 2: first normalize both variables to their class
+        // representatives.  The rest of the function only reasons about roots.
         let mut ra = self.find(a);
         let mut rb = self.find(b);
         if ra == rb {
             return Ok(());
         }
 
+        // Preserve the invariant "one class has at most one concrete type".
+        // If both classes already know different concrete types, merging them
+        // would make a single type variable mean two incompatible things.
         let merged = match (&self.concrete[ra], &self.concrete[rb]) {
             (None, None) => None,
             (Some(t), None) | (None, Some(t)) => Some(t.clone()),
@@ -213,6 +225,8 @@ impl UnionFind {
             }
         };
 
+        // Union by rank keeps the parent forest shallow.  The chosen root is
+        // the only place that should keep the merged concrete binding.
         if self.rank[ra] < self.rank[rb] {
             std::mem::swap(&mut ra, &mut rb);
         }
@@ -231,6 +245,8 @@ impl UnionFind {
     /// yet.  The resolve phase of Pass 2.5 calls this exactly once per
     /// pending function.
     fn resolve(&mut self, x: TypeId) -> Option<Dtype> {
+        // asmt-2 TODO 3: always go through `find`, otherwise a non-root
+        // variable would read a stale `None` even though its class was solved.
         let root = self.find(x);
         self.concrete[root].clone()
     }
@@ -252,6 +268,10 @@ impl UnionFind {
 /// `symbol` is the identifier the caller wants blamed in any diagnostic
 /// (usually a variable name, a function name, or `self.fn_name`).
 fn unify(uf: &mut UnionFind, a: &Ty, b: &Ty, symbol: &str) -> Result<(), Error> {
+    // asmt-2 TODO 4: `unify` is the public operation used by the collector.
+    // Concrete/concrete constraints are checked immediately; constraints that
+    // mention a type variable are delegated to union-find so they can be solved
+    // after all function bodies have contributed information.
     match (a, b) {
         (Ty::Concrete(left), Ty::Concrete(right)) if left == right => Ok(()),
         (Ty::Concrete(left), Ty::Concrete(right)) => Err(Error::TypeMismatch {
@@ -320,12 +340,20 @@ pub(crate) fn resolve_return_types(
         return Ok(());
     }
 
+    // asmt-2 TODO 10, Phase 2: walk every function body, including functions
+    // with explicit return types.  An explicitly typed function can still call
+    // a pending callee, and that call site contributes constraints to the
+    // callee's return variable.
     for elem in elements {
         if let ast::ProgramElementInner::FnDef(fn_def) = &elem.inner {
             collect_constraints(registry, globals, &pending_returns, &mut uf, fn_def)?;
         }
     }
 
+    // asmt-2 TODO 10, Phase 3: turn each pending α_f into the concrete return
+    // type that Pass 3 expects in `Registry.function_types`.  A completely
+    // unconstrained function means "no value was ever returned", so it keeps
+    // TeaLang's old omitted-return semantics and becomes `void`.
     for (name, type_id) in pending_returns {
         let dtype = uf.resolve(type_id).unwrap_or(Dtype::Void);
         match &dtype {
@@ -513,8 +541,14 @@ impl Collector<'_> {
     fn process_var_def(&mut self, def: &ast::VarDef) -> Result<(), Error> {
         match &def.inner {
             ast::VarDefInner::Scalar(scalar) => {
+                // asmt-2 TODO 5: the initializer may be a pending function
+                // call, so its type is a `Ty`, not necessarily a concrete
+                // `Dtype`.
                 let rhs = self.type_of_right_val(&scalar.val)?;
                 let ty = if let Some(type_specifier) = &def.type_specifier {
+                    // `let x: T = e;` contributes the constraint T = typeOf(e).
+                    // This lets an explicit local annotation solve a pending
+                    // callee, e.g. `let x: i32 = f();` binds α_f to i32.
                     let lhs = Ty::concrete(compose_var_def_dtype(
                         Dtype::from(type_specifier),
                         &def.inner,
@@ -522,11 +556,16 @@ impl Collector<'_> {
                     unify(self.uf, &lhs, &rhs, &def.identifier)?;
                     lhs
                 } else {
+                    // `let x = e;` stores the RHS as-is.  If RHS is α_f, later
+                    // uses of `x` carry that same unresolved return variable.
                     rhs
                 };
                 self.env.insert(def.identifier.clone(), ty);
             }
             ast::VarDefInner::Array(array) => {
+                // Arrays themselves stay concrete in this assignment.  We still
+                // walk the initializer so calls inside `{ f(), 1 }` can emit
+                // constraints for pending callees.
                 let base = def.type_specifier.as_ref().map_or(Dtype::I32, Dtype::from);
                 let ty = Ty::concrete(compose_var_def_dtype(base, &def.inner));
                 self.check_array_initializer(&array.initializer)?;
@@ -656,10 +695,14 @@ impl Collector<'_> {
         env_a: &HashMap<String, Ty>,
         env_b: &HashMap<String, Ty>,
     ) -> Result<(), Error> {
+        // asmt-2 TODO 6: only variables visible before the `if` survive the
+        // merge point.  Branch-local declarations go out of scope here.
         let base = self.env.clone();
         for (name, base_ty) in &base {
             let ty_a = env_a.get(name).unwrap_or(base_ty);
             let ty_b = env_b.get(name).unwrap_or(base_ty);
+            // If one arm learned `x` is α_f and the other learned `x` is i32,
+            // this single unification propagates i32 into α_f.
             unify(self.uf, ty_a, ty_b, name)?;
             self.env.insert(name.clone(), ty_a.clone());
         }
@@ -676,6 +719,8 @@ impl Collector<'_> {
     ///
     /// Mirrors `type_infer.rs::merge_env_single`.
     fn merge_with_body(&mut self, branch_env: &HashMap<String, Ty>) -> Result<(), Error> {
+        // asmt-2 TODO 7: a loop may run zero times, so the post-loop type must
+        // be compatible with the pre-loop environment as well as the body.
         let base = self.env.clone();
         for (name, base_ty) in &base {
             let body_ty = branch_env.get(name).unwrap_or(base_ty);
@@ -706,6 +751,9 @@ impl Collector<'_> {
     ///   compatibility check in that case, so there is nothing to do
     ///   here.
     fn process_return(&mut self, stmt: &ast::ReturnStmt) -> Result<(), Error> {
+        // asmt-2 TODO 8: explicit-return functions are intentionally ignored
+        // by this pass.  Their checks happen later in the normal forward-flow
+        // type inference, after omitted signatures have been filled in.
         let Some(return_var) = self.return_var else {
             return Ok(());
         };
@@ -714,6 +762,9 @@ impl Collector<'_> {
             Some(val) => self.type_of_right_val(val)?,
             None => Ty::concrete(Dtype::Void),
         };
+        // For an omitted-return function, every return site constrains the
+        // same α_f.  Mixed `return;` and `return expr;` therefore meet here and
+        // become a TypeMismatch during unification.
         unify(self.uf, &Ty::Var(return_var), &actual, self.fn_name)
     }
 
@@ -848,15 +899,21 @@ impl Collector<'_> {
     ///   and wrap its `return_dtype` as `Ty::Concrete(...)`.  Undefined
     ///   callees are `Error::FunctionNotDefined`.
     fn type_of_fn_call(&mut self, call: &ast::FnCall) -> Result<Ty, Error> {
+        // asmt-2 TODO 9: arguments are walked for side effects, because an
+        // argument expression may itself call a pending function.
         for arg in &call.vals {
             self.type_of_right_val(arg)?;
         }
 
         let name = call.qualified_name();
         if let Some(type_id) = self.pending.get(&name) {
+            // Pending callees return their α_callee.  This is what lets
+            // `let half = pow(...);` keep a type even before α_pow is solved.
             return Ok(Ty::Var(*type_id));
         }
 
+        // Non-pending functions already have concrete return types in the
+        // registry, either because they were explicit or already imported.
         self.registry
             .function_types
             .get(&name)

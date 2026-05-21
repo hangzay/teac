@@ -129,7 +129,9 @@ pub struct FnDecl {
     pub identifier: String,
     /// Optional parameter declaration; `None` means no parameters.
     pub param_decl: Option<Box<ParamDecl>>,
-    /// Optional return type; `None` means the function returns nothing (void).
+    /// Optional return type annotation.  In the default pipeline `None` is
+    /// treated as `void`; with `return-type-inference`, `None` means the return
+    /// type is omitted in source and will be filled by the experimental pass.
     pub return_dtype: Option<TypeSpecifier>,
 }
 
