@@ -129,9 +129,9 @@ pub struct FnDecl {
     pub identifier: String,
     /// Optional parameter declaration; `None` means no parameters.
     pub param_decl: Option<Box<ParamDecl>>,
-    /// Optional return type annotation.  In the default pipeline `None` is
-    /// treated as `void`; with `return-type-inference`, `None` means the return
-    /// type is omitted in source and will be filled by the experimental pass.
+    /// 可选返回类型标注。默认管线把 `None` 当作 `void`；开启
+    /// `return-type-inference` 后，`None` 表示源码省略返回类型，
+    /// 由实验二的推断 pass 在 IR 生成前补齐。
     pub return_dtype: Option<TypeSpecifier>,
 }
 

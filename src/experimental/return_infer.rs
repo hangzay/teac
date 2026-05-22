@@ -48,8 +48,8 @@
 //!    the union-find for the concrete type of `α_f` and write it back
 //!    to `registry.function_types[name].return_dtype`.  Unresolved
 //!    variables fall back to `void`; unsupported resolutions are errors.
-//!    In the combined assignment branch this pass accepts `void`, `i32`,
-//!    and `f32`, because assign3 adds `f32` to the IR type system.
+//!    当前合并后的实验分支允许 `void`、`i32` 和 assign3 引入的
+//!    `f32` 作为返回类型。
 //!
 //! Steps 2 and 3 use a single shared [`UnionFind`]: constraints from one
 //! function's body can resolve the return type of another — that is the
@@ -164,14 +164,12 @@ impl UnionFind {
     ///
     /// See `docs/asmt-2.md` §3.2 (核心不变式) and §3.3 (工作示例).
     fn bind(&mut self, x: TypeId, dtype: Dtype, symbol: &str) -> Result<(), Error> {
-        // asmt-2 TODO 1: bind the equivalence class root, not the raw
-        // variable id.  After previous unions, `x` may already point to
-        // another representative, and only the root's concrete slot is live.
+        // 实验二 TODO 1：类型变量可能已经被 union 到别的集合，
+        // 所以必须先找根节点，只在根节点保存具体类型。
         let root = self.find(x);
         match &self.concrete[root] {
             None => {
-                // First concrete observation for this class, e.g.
-                // `return 1;` pins α_f to i32.
+                // 第一次获得具体类型约束，例如 `return 1;` 会把 α_f 绑定为 i32。
                 self.concrete[root] = Some(dtype);
                 Ok(())
             }
@@ -201,17 +199,15 @@ impl UnionFind {
     /// exactly the "one side concrete, the other empty" row; the `bind`
     /// conflict at the end demonstrates the last row in miniature.
     fn union(&mut self, a: TypeId, b: TypeId, symbol: &str) -> Result<(), Error> {
-        // asmt-2 TODO 2: first normalize both variables to their class
-        // representatives.  The rest of the function only reasons about roots.
+        // 实验二 TODO 2：合并前先找两个等价类的根，后续只处理根节点。
         let mut ra = self.find(a);
         let mut rb = self.find(b);
         if ra == rb {
             return Ok(());
         }
 
-        // Preserve the invariant "one class has at most one concrete type".
-        // If both classes already know different concrete types, merging them
-        // would make a single type variable mean two incompatible things.
+        // 核心不变式：一个等价类最多只能绑定一个具体类型。
+        // 两边已有不同具体类型时，说明返回类型推断发生冲突。
         let merged = match (&self.concrete[ra], &self.concrete[rb]) {
             (None, None) => None,
             (Some(t), None) | (None, Some(t)) => Some(t.clone()),
@@ -225,8 +221,7 @@ impl UnionFind {
             }
         };
 
-        // Union by rank keeps the parent forest shallow.  The chosen root is
-        // the only place that should keep the merged concrete binding.
+        // 按秩合并降低树高；合并后的具体类型只保存在新的根节点上。
         if self.rank[ra] < self.rank[rb] {
             std::mem::swap(&mut ra, &mut rb);
         }
@@ -245,8 +240,7 @@ impl UnionFind {
     /// yet.  The resolve phase of Pass 2.5 calls this exactly once per
     /// pending function.
     fn resolve(&mut self, x: TypeId) -> Option<Dtype> {
-        // asmt-2 TODO 3: always go through `find`, otherwise a non-root
-        // variable would read a stale `None` even though its class was solved.
+        // 实验二 TODO 3：解析时也必须找根，否则非根节点可能读到过期的 None。
         let root = self.find(x);
         self.concrete[root].clone()
     }
@@ -268,10 +262,7 @@ impl UnionFind {
 /// `symbol` is the identifier the caller wants blamed in any diagnostic
 /// (usually a variable name, a function name, or `self.fn_name`).
 fn unify(uf: &mut UnionFind, a: &Ty, b: &Ty, symbol: &str) -> Result<(), Error> {
-    // asmt-2 TODO 4: `unify` is the public operation used by the collector.
-    // Concrete/concrete constraints are checked immediately; constraints that
-    // mention a type variable are delegated to union-find so they can be solved
-    // after all function bodies have contributed information.
+    // 实验二 TODO 4：统一约束入口。具体类型直接比较，涉及类型变量时交给并查集延迟求解。
     match (a, b) {
         (Ty::Concrete(left), Ty::Concrete(right)) if left == right => Ok(()),
         (Ty::Concrete(left), Ty::Concrete(right)) => Err(Error::TypeMismatch {
@@ -340,20 +331,14 @@ pub(crate) fn resolve_return_types(
         return Ok(());
     }
 
-    // asmt-2 TODO 10, Phase 2: walk every function body, including functions
-    // with explicit return types.  An explicitly typed function can still call
-    // a pending callee, and that call site contributes constraints to the
-    // callee's return variable.
+    // 实验二 TODO 10：收集阶段遍历所有函数体。显式返回类型函数也可能调用待推断函数。
     for elem in elements {
         if let ast::ProgramElementInner::FnDef(fn_def) = &elem.inner {
             collect_constraints(registry, globals, &pending_returns, &mut uf, fn_def)?;
         }
     }
 
-    // asmt-2 TODO 10, Phase 3: turn each pending α_f into the concrete return
-    // type that Pass 3 expects in `Registry.function_types`.  A completely
-    // unconstrained function means "no value was ever returned", so it keeps
-    // TeaLang's old omitted-return semantics and becomes `void`.
+    // 实验二 TODO 10：求解阶段把 α_f 写回 Registry；无约束函数沿用旧语义，返回 void。
     for (name, type_id) in pending_returns {
         let dtype = uf.resolve(type_id).unwrap_or(Dtype::Void);
         match &dtype {
@@ -541,14 +526,10 @@ impl Collector<'_> {
     fn process_var_def(&mut self, def: &ast::VarDef) -> Result<(), Error> {
         match &def.inner {
             ast::VarDefInner::Scalar(scalar) => {
-                // asmt-2 TODO 5: the initializer may be a pending function
-                // call, so its type is a `Ty`, not necessarily a concrete
-                // `Dtype`.
+                // 实验二 TODO 5：初始化表达式可能调用待推断函数，因此类型先表示为 Ty。
                 let rhs = self.type_of_right_val(&scalar.val)?;
                 let ty = if let Some(type_specifier) = &def.type_specifier {
-                    // `let x: T = e;` contributes the constraint T = typeOf(e).
-                    // This lets an explicit local annotation solve a pending
-                    // callee, e.g. `let x: i32 = f();` binds α_f to i32.
+                    // `let x: T = e;` 产生 T = typeOf(e) 约束，可反向锁定被调用函数返回类型。
                     let lhs = Ty::concrete(compose_var_def_dtype(
                         Dtype::from(type_specifier),
                         &def.inner,
@@ -556,16 +537,13 @@ impl Collector<'_> {
                     unify(self.uf, &lhs, &rhs, &def.identifier)?;
                     lhs
                 } else {
-                    // `let x = e;` stores the RHS as-is.  If RHS is α_f, later
-                    // uses of `x` carry that same unresolved return variable.
+                    // `let x = e;` 直接保存 RHS；若 RHS 是 α_f，后续使用 x 会继续携带该变量。
                     rhs
                 };
                 self.env.insert(def.identifier.clone(), ty);
             }
             ast::VarDefInner::Array(array) => {
-                // Arrays themselves stay concrete in this assignment.  We still
-                // walk the initializer so calls inside `{ f(), 1 }` can emit
-                // constraints for pending callees.
+                // 数组类型本身保持具体；仍需遍历初始化器，让其中的函数调用贡献约束。
                 let base = def.type_specifier.as_ref().map_or(Dtype::I32, Dtype::from);
                 let ty = Ty::concrete(compose_var_def_dtype(base, &def.inner));
                 self.check_array_initializer(&array.initializer)?;
@@ -695,14 +673,12 @@ impl Collector<'_> {
         env_a: &HashMap<String, Ty>,
         env_b: &HashMap<String, Ty>,
     ) -> Result<(), Error> {
-        // asmt-2 TODO 6: only variables visible before the `if` survive the
-        // merge point.  Branch-local declarations go out of scope here.
+        // 实验二 TODO 6：只合并 if 前已经可见的变量，分支内部新声明变量在此离开作用域。
         let base = self.env.clone();
         for (name, base_ty) in &base {
             let ty_a = env_a.get(name).unwrap_or(base_ty);
             let ty_b = env_b.get(name).unwrap_or(base_ty);
-            // If one arm learned `x` is α_f and the other learned `x` is i32,
-            // this single unification propagates i32 into α_f.
+            // 两个分支的同名变量必须可统一，例如一边是 α_f、另一边是 i32 时会解出 α_f=i32。
             unify(self.uf, ty_a, ty_b, name)?;
             self.env.insert(name.clone(), ty_a.clone());
         }
@@ -719,8 +695,7 @@ impl Collector<'_> {
     ///
     /// Mirrors `type_infer.rs::merge_env_single`.
     fn merge_with_body(&mut self, branch_env: &HashMap<String, Ty>) -> Result<(), Error> {
-        // asmt-2 TODO 7: a loop may run zero times, so the post-loop type must
-        // be compatible with the pre-loop environment as well as the body.
+        // 实验二 TODO 7：循环可能执行 0 次，因此循环体结果必须和循环前环境兼容。
         let base = self.env.clone();
         for (name, base_ty) in &base {
             let body_ty = branch_env.get(name).unwrap_or(base_ty);
@@ -751,9 +726,7 @@ impl Collector<'_> {
     ///   compatibility check in that case, so there is nothing to do
     ///   here.
     fn process_return(&mut self, stmt: &ast::ReturnStmt) -> Result<(), Error> {
-        // asmt-2 TODO 8: explicit-return functions are intentionally ignored
-        // by this pass.  Their checks happen later in the normal forward-flow
-        // type inference, after omitted signatures have been filled in.
+        // 实验二 TODO 8：显式返回类型函数留给普通 type_infer 检查；这里只处理省略返回类型函数。
         let Some(return_var) = self.return_var else {
             return Ok(());
         };
@@ -762,9 +735,7 @@ impl Collector<'_> {
             Some(val) => self.type_of_right_val(val)?,
             None => Ty::concrete(Dtype::Void),
         };
-        // For an omitted-return function, every return site constrains the
-        // same α_f.  Mixed `return;` and `return expr;` therefore meet here and
-        // become a TypeMismatch during unification.
+        // 同一函数的所有 return 都约束同一个 α_f，混用 `return;` 和 `return expr;` 会在这里报错。
         unify(self.uf, &Ty::Var(return_var), &actual, self.fn_name)
     }
 
@@ -899,21 +870,18 @@ impl Collector<'_> {
     ///   and wrap its `return_dtype` as `Ty::Concrete(...)`.  Undefined
     ///   callees are `Error::FunctionNotDefined`.
     fn type_of_fn_call(&mut self, call: &ast::FnCall) -> Result<Ty, Error> {
-        // asmt-2 TODO 9: arguments are walked for side effects, because an
-        // argument expression may itself call a pending function.
+        // 实验二 TODO 9：实参表达式也可能调用待推断函数，必须先遍历以收集约束。
         for arg in &call.vals {
             self.type_of_right_val(arg)?;
         }
 
         let name = call.qualified_name();
         if let Some(type_id) = self.pending.get(&name) {
-            // Pending callees return their α_callee.  This is what lets
-            // `let half = pow(...);` keep a type even before α_pow is solved.
+            // 待推断被调函数返回自己的 α_callee，自递归调用因此可以先占位、后求解。
             return Ok(Ty::Var(*type_id));
         }
 
-        // Non-pending functions already have concrete return types in the
-        // registry, either because they were explicit or already imported.
+        // 非待推断函数在 Registry 中已有具体返回类型，直接包装为 Ty::Concrete。
         self.registry
             .function_types
             .get(&name)
