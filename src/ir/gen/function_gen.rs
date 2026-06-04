@@ -27,6 +27,36 @@ fn array_index_operand(index: usize) -> Operand {
     )
 }
 
+fn method_name(impl_name: &str, method_name: &str) -> String {
+    format!("{impl_name}::{method_name}")
+}
+
+fn impl_type_from_function_name(name: &str, registry: &crate::ir::Registry) -> Option<String> {
+    let (impl_name, _) = name.rsplit_once("::")?;
+    registry
+        .struct_types
+        .contains_key(impl_name)
+        .then(|| impl_name.to_string())
+}
+
+/// Returns the element type of the array pointed to by `base_ptr`.
+///
+/// Expects `base_ptr` to have IR type `Pointer { pointee: Array { element, .. } }`
+/// — the canonical shape produced by `allocate_pointer_local` for an
+/// array local — and panics otherwise.  The caller (`init_array` /
+/// `init_array_from`) only feeds in operands minted by
+/// `allocate_pointer_local`, so the panic catches an upstream invariant
+/// break rather than a user-visible error.
+fn array_element_dtype(base_ptr: &Operand) -> Dtype {
+    match base_ptr.dtype() {
+        Dtype::Pointer { pointee } => match pointee.as_ref() {
+            Dtype::Array { element, .. } => element.as_ref().clone(),
+            other => panic!("array initializer base points to non-array `{other}`"),
+        },
+        other => panic!("array initializer base is not a pointer: `{other}`"),
+    }
+}
+
 // -----------------------------------------------------------------------
 // Function entry-point generation
 // -----------------------------------------------------------------------
@@ -46,6 +76,7 @@ impl FunctionGenerator<'_> {
     /// an argument name is redefined, or the return type is unsupported.
     pub fn generate(&mut self, from: &ast::FnDef) -> Result<(), Error> {
         let identifier = &from.fn_decl.identifier;
+        self.current_impl_type = impl_type_from_function_name(identifier, self.registry);
         let function_type = self
             .registry
             .function_types
@@ -71,6 +102,20 @@ impl FunctionGenerator<'_> {
             // Allocate a virtual register that carries the incoming argument value.
             let arg_local = self.fresh_local(dtype.clone());
             self.arguments.push(arg_local.clone());
+
+            // 方法的 `self` 参数已经是结构体指针，直接放入局部变量表；
+            // 若再按普通参数 alloca+store，会变成指针的指针，后续
+            // `self.field` 的 GEP 基址就会多一层。
+            if id == "self"
+                && matches!(
+                    dtype,
+                    Dtype::Pointer { pointee }
+                        if matches!(pointee.as_ref(), Dtype::Struct { .. })
+                )
+            {
+                self.local_variables.insert(id.clone(), arg_local);
+                continue;
+            }
 
             // Allocate a stack slot (pointer to the argument type) for the argument.
             let slot = self.fresh_local(Dtype::ptr_to(dtype.clone()));
@@ -191,18 +236,6 @@ impl FunctionGenerator<'_> {
         }
     }
 
-    /// Returns the element type for an array storage pointer, if known.
-    fn array_element_dtype(base_ptr: &Operand) -> Option<Dtype> {
-        match base_ptr.dtype() {
-            Dtype::Pointer { pointee } => match pointee.as_ref() {
-                Dtype::Array { element, .. } => Some(element.as_ref().clone()),
-                other => Some(other.clone()),
-            },
-            Dtype::Array { element, .. } => Some(element.as_ref().clone()),
-            _ => None,
-        }
-    }
-
     /// Inserts the IR conversion needed to coerce an operand to `target`.
     fn coerce_operand(&mut self, operand: Operand, target: &Dtype) -> Result<Operand, Error> {
         if operand.dtype() == target {
@@ -253,7 +286,30 @@ impl FunctionGenerator<'_> {
 
     /// Lowers a function call and optionally returns its result operand.
     fn lower_fn_call(&mut self, fn_call: &ast::FnCall) -> Result<Option<Operand>, Error> {
-        let function_name = fn_call.qualified_name();
+        let mut args = Vec::new();
+        let function_name = if let Some(receiver) = &fn_call.receiver {
+            let receiver_ptr = self.handle_left_val(receiver)?;
+            let type_name = receiver_ptr
+                .dtype()
+                .struct_type_name()
+                .ok_or_else(|| Error::FunctionNotDefined {
+                    symbol: fn_call.name.clone(),
+                })?
+                .clone();
+            let function_name = method_name(&type_name, &fn_call.name);
+            args.push(receiver_ptr);
+            function_name
+        } else if fn_call.module_prefix.as_deref() == Some("Self") {
+            let impl_name =
+                self.current_impl_type
+                    .as_ref()
+                    .ok_or_else(|| Error::FunctionNotDefined {
+                        symbol: fn_call.qualified_name(),
+                    })?;
+            method_name(impl_name, &fn_call.name)
+        } else {
+            fn_call.qualified_name()
+        };
         let function_type = self
             .registry
             .function_types
@@ -263,10 +319,20 @@ impl FunctionGenerator<'_> {
                 symbol: function_name.clone(),
             })?;
 
-        let mut args = Vec::new();
+        let explicit_offset = usize::from(fn_call.receiver.is_some());
+        if explicit_offset == 1 {
+            let receiver = args.pop().expect("receiver arg was pushed above");
+            let receiver = if let Some((_, expected)) = function_type.arguments.first() {
+                self.coerce_operand(receiver, expected)?
+            } else {
+                receiver
+            };
+            args.push(receiver);
+        }
+
         for (idx, arg) in fn_call.vals.iter().enumerate() {
             let mut right_val = self.handle_right_val(arg)?;
-            if let Some((_, expected)) = function_type.arguments.get(idx) {
+            if let Some((_, expected)) = function_type.arguments.get(idx + explicit_offset) {
                 right_val = self.coerce_operand(right_val, expected)?;
             }
             args.push(right_val);
@@ -369,9 +435,10 @@ impl FunctionGenerator<'_> {
     /// - `base_ptr`: operand pointing to the first element of the array.
     /// - `vals`: list of right-hand-side values to store sequentially.
     pub fn init_array(&mut self, base_ptr: &Operand, vals: &RightValList) -> Result<(), Error> {
-        let element_dtype = Self::array_element_dtype(base_ptr).unwrap_or(Dtype::I32);
+        let element_dtype = array_element_dtype(base_ptr);
+        let elem_ptr_dtype = Dtype::ptr_to(element_dtype.clone());
         for (i, val) in vals.iter().enumerate() {
-            let element_ptr = Operand::from(self.fresh_local(Dtype::ptr_to(element_dtype.clone())));
+            let element_ptr = Operand::from(self.fresh_local(elem_ptr_dtype.clone()));
             let right_elem = self.handle_right_val(val)?;
             let right_elem = self.coerce_operand(right_elem, &element_dtype)?;
 
@@ -398,12 +465,12 @@ impl FunctionGenerator<'_> {
         match initializer {
             ArrayInitializer::ExplicitList(vals) => self.init_array(base_ptr, vals),
             ArrayInitializer::Fill { val, count } => {
-                let element_dtype = Self::array_element_dtype(base_ptr).unwrap_or(Dtype::I32);
+                let element_dtype = array_element_dtype(base_ptr);
+                let elem_ptr_dtype = Dtype::ptr_to(element_dtype.clone());
                 let fill_val = self.handle_right_val(val)?;
                 let fill_val = self.coerce_operand(fill_val, &element_dtype)?;
                 for i in 0..*count {
-                    let element_ptr =
-                        Operand::from(self.fresh_local(Dtype::ptr_to(element_dtype.clone())));
+                    let element_ptr = Operand::from(self.fresh_local(elem_ptr_dtype.clone()));
                     self.emit_gep(
                         element_ptr.clone(),
                         base_ptr.clone(),

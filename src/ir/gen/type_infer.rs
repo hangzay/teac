@@ -79,6 +79,7 @@ struct TypeInference<'a> {
     registry: &'a Registry,
     globals: &'a IndexMap<Rc<str>, GlobalDef>,
     env: TypeEnv,
+    current_impl_type: Option<String>,
 }
 
 impl TypeInference<'_> {
@@ -91,8 +92,21 @@ impl TypeInference<'_> {
             registry: self.registry,
             globals: self.globals,
             env,
+            current_impl_type: self.current_impl_type.clone(),
         }
     }
+}
+
+fn method_name(impl_name: &str, method_name: &str) -> String {
+    format!("{impl_name}::{method_name}")
+}
+
+fn impl_type_from_function_name(name: &str, registry: &Registry) -> Option<String> {
+    let (impl_name, _) = name.rsplit_once("::")?;
+    registry
+        .struct_types
+        .contains_key(impl_name)
+        .then(|| impl_name.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +126,7 @@ pub fn infer_function(
         registry,
         globals,
         env: TypeEnv::new(),
+        current_impl_type: impl_type_from_function_name(&fn_def.fn_decl.identifier, registry),
     };
 
     // Seed the environment with the function's parameters so that references
@@ -541,11 +556,36 @@ impl TypeInference<'_> {
     /// Type of a function call expression.
     fn type_of_fn_call(&self, call: &ast::FnCall) -> Result<Dtype, Error> {
         self.check_call_args(call)?;
-        let name = call.qualified_name();
+        let name = self.resolve_call_name(call)?;
         match self.registry.function_types.get(&name) {
             Some(ft) => Ok(ft.return_dtype.clone()),
             None => Err(Error::FunctionNotDefined { symbol: name }),
         }
+    }
+
+    fn resolve_call_name(&self, call: &ast::FnCall) -> Result<String, Error> {
+        if let Some(receiver) = &call.receiver {
+            let receiver_dtype = self.type_of_left_val(receiver)?;
+            let type_name =
+                receiver_dtype
+                    .struct_type_name()
+                    .ok_or_else(|| Error::FunctionNotDefined {
+                        symbol: call.name.clone(),
+                    })?;
+            return Ok(method_name(type_name, &call.name));
+        }
+
+        if call.module_prefix.as_deref() == Some("Self") {
+            let impl_name =
+                self.current_impl_type
+                    .as_ref()
+                    .ok_or_else(|| Error::FunctionNotDefined {
+                        symbol: call.qualified_name(),
+                    })?;
+            return Ok(method_name(impl_name, &call.name));
+        }
+
+        Ok(call.qualified_name())
     }
 
     fn check_call_args(&self, call: &ast::FnCall) -> Result<(), Error> {

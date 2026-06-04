@@ -24,6 +24,41 @@ use std::fs;
 use std::io::Write;
 use std::rc::Rc;
 
+fn method_name(impl_name: &str, method_name: &str) -> String {
+    format!("{impl_name}::{method_name}")
+}
+
+fn self_param_for_impl(impl_name: &str) -> ast::VarDecl {
+    ast::VarDecl {
+        identifier: "self".to_string(),
+        type_specifier: Some(ast::TypeSpecifier {
+            pos: 0,
+            inner: ast::TypeSpecifierInner::Composite(impl_name.to_string()),
+        }),
+        inner: ast::VarDeclInner::Scalar,
+    }
+}
+
+fn method_fn_def_for_generation(impl_name: &str, method: &ast::FnDef) -> ast::FnDef {
+    let mut method = method.clone();
+    method.fn_decl.identifier = method_name(impl_name, &method.fn_decl.identifier);
+
+    // 类型推断读取 AST 参数环境；解析器不会保留 `&self`，因此这里
+    // 给方法体补一个结构体值语义的 `self`。真正的 IR 函数签名在
+    // Registry 中单独注册为 `ptr %Struct`。
+    let self_param = self_param_for_impl(impl_name);
+    match &mut method.fn_decl.param_decl {
+        Some(params) => params.decls.insert(0, self_param),
+        None => {
+            method.fn_decl.param_decl = Some(Box::new(ast::ParamDecl {
+                decls: vec![self_param],
+            }));
+        }
+    }
+
+    method
+}
+
 /// Implements the two-phase `Generator` trait for the module-level IR generator.
 impl Generator for IrGenerator<'_> {
     type Error = Error;
@@ -66,7 +101,7 @@ impl Generator for IrGenerator<'_> {
                 ast::ProgramElementInner::StructDef(struct_def) => {
                     self.handle_struct_def(struct_def)?;
                 }
-                ast::ProgramElementInner::ImplDef(_) => {}
+                ast::ProgramElementInner::ImplDef(impl_def) => self.handle_impl_def(impl_def)?,
             }
         }
 
@@ -82,48 +117,17 @@ impl Generator for IrGenerator<'_> {
             result?;
         }
 
-        // Pass 3: generate IR bodies for every function definition.
+        // Pass 3: generate IR bodies for every function and method definition.
         for elem in &input.elements {
-            if let ast::ProgramElementInner::FnDef(fn_def) = &elem.inner {
-                // Run the type inference pass to resolve all local variable
-                // types before IR generation.  The pass sees the same name
-                // environment as `FunctionGenerator` — struct/function types
-                // from the registry plus the module's global variable list —
-                // so every identifier inside the function body resolves
-                // consistently in both passes.
-                let resolved_types =
-                    type_infer::infer_function(&self.registry, &self.module.global_list, fn_def)?;
-
-                // Use a scoped FunctionGenerator so its temporary state is
-                // dropped before we mutably borrow `self.module` below.
-                let body = {
-                    let mut function_generator = FunctionGenerator::new(
-                        &self.registry,
-                        &self.module.global_list,
-                        resolved_types,
-                    );
-                    function_generator.generate(fn_def)?;
-
-                    FunctionBody {
-                        arguments: function_generator.arguments,
-                        blocks: Self::harvest_function_irs(function_generator.irs),
-                        next_vreg: function_generator.next_vreg,
-                    }
-                };
-
-                // Attach the body to the Function entry created during pass 2.
-                match self
-                    .module
-                    .function_list
-                    .get_mut(&fn_def.fn_decl.identifier)
-                {
-                    Some(f) => f.body = Some(body),
-                    None => {
-                        return Err(Error::FunctionNotDefined {
-                            symbol: fn_def.fn_decl.identifier.clone(),
-                        });
+            match &elem.inner {
+                ast::ProgramElementInner::FnDef(fn_def) => self.generate_function_body(fn_def)?,
+                ast::ProgramElementInner::ImplDef(impl_def) => {
+                    for method in &impl_def.methods {
+                        let method = method_fn_def_for_generation(&impl_def.name, method);
+                        self.generate_function_body(&method)?;
                     }
                 }
+                _ => {}
             }
         }
 
@@ -143,6 +147,114 @@ impl Generator for IrGenerator<'_> {
 
 /// Private helper methods on `IrGenerator` for each category of top-level AST node.
 impl IrGenerator<'_> {
+    fn register_function_signature(
+        &mut self,
+        identifier: String,
+        function_type: FunctionType,
+        is_external: bool,
+    ) -> Result<(), Error> {
+        if let Some(prior) = self.registry.function_types.get(&identifier) {
+            if *prior != function_type {
+                return Err(Error::ConflictedFunction { symbol: identifier });
+            }
+            // Signature matched a prior registration; keep the first-written
+            // link name and skeleton intact so that a later declaration (e.g.
+            // a forward decl that follows the definition) cannot silently
+            // re-mangle the symbol.
+            return Ok(());
+        }
+
+        let link_name = compute_link_name(&identifier, is_external);
+        if let Some((existing, _)) = self
+            .registry
+            .link_names
+            .iter()
+            .find(|(_, existing_link_name)| *existing_link_name == &link_name)
+        {
+            return Err(Error::ConflictedLinkName {
+                symbol: identifier,
+                existing: existing.clone(),
+                link_name,
+            });
+        }
+
+        self.registry
+            .function_types
+            .insert(identifier.clone(), function_type);
+        self.registry
+            .link_names
+            .insert(identifier.clone(), link_name.clone());
+
+        self.module.function_list.insert(
+            identifier.clone(),
+            Function {
+                identifier,
+                link_name,
+                body: None,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn method_function_type(
+        &self,
+        impl_name: &str,
+        decl: &ast::FnDecl,
+    ) -> Result<FunctionType, Error> {
+        let mut function_type = FunctionType::try_from(decl)?;
+        function_type.arguments.insert(
+            0,
+            (
+                "self".to_string(),
+                Dtype::ptr_to(Dtype::Struct {
+                    type_name: impl_name.to_string(),
+                }),
+            ),
+        );
+        Ok(function_type)
+    }
+
+    fn handle_impl_def(&mut self, impl_def: &ast::ImplDef) -> Result<(), Error> {
+        for method in &impl_def.methods {
+            let identifier = method_name(&impl_def.name, &method.fn_decl.identifier);
+            let function_type = self.method_function_type(&impl_def.name, &method.fn_decl)?;
+            self.register_function_signature(identifier, function_type, false)?;
+        }
+        Ok(())
+    }
+
+    fn generate_function_body(&mut self, fn_def: &ast::FnDef) -> Result<(), Error> {
+        let resolved_types =
+            type_infer::infer_function(&self.registry, &self.module.global_list, fn_def)?;
+
+        let body = {
+            let mut function_generator =
+                FunctionGenerator::new(&self.registry, &self.module.global_list, resolved_types);
+            function_generator.generate(fn_def)?;
+
+            FunctionBody {
+                arguments: function_generator.arguments,
+                blocks: Self::harvest_function_irs(function_generator.irs),
+                next_vreg: function_generator.next_vreg,
+            }
+        };
+
+        match self
+            .module
+            .function_list
+            .get_mut(&fn_def.fn_decl.identifier)
+        {
+            Some(f) => {
+                f.body = Some(body);
+                Ok(())
+            }
+            None => Err(Error::FunctionNotDefined {
+                symbol: fn_def.fn_decl.identifier.clone(),
+            }),
+        }
+    }
+
     /// Process a single `use` statement from the source program.
     ///
     /// Resolves the path to `<module_name>.teah` relative to the source

@@ -123,6 +123,9 @@ pub struct FunctionGenerator<'ir> {
     pub next_basic_block: usize,
     /// Return type of the function currently being generated.
     pub current_return_dtype: Option<Dtype>,
+    /// Struct type currently being lowered when this function is an impl
+    /// method. Used to resolve `Self::method(...)` calls inside method bodies.
+    pub current_impl_type: Option<String>,
 }
 
 impl<'ir> FunctionGenerator<'ir> {
@@ -148,6 +151,7 @@ impl<'ir> FunctionGenerator<'ir> {
             next_vreg: 0,
             next_basic_block: 1,
             current_return_dtype: None,
+            current_impl_type: None,
         }
     }
 

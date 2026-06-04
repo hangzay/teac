@@ -1,6 +1,12 @@
-use super::inst::Inst;
-use super::types::{dtype_to_regsize, Addr, BinOp, Cond, IndexOperand, Operand, RegSize, Register};
-use crate::asm::common::{align_up, StackFrame, StackSlot, StructLayouts};
+use super::aapcs::{classify_args, ArgumentLocation};
+use super::frame::{outgoing_arg_addr, outgoing_stack_bytes, FrameLayout};
+use super::inst::Instruction;
+use super::phi_lowering::{self, ParallelCopy, SplitEdge};
+use super::types::{
+    Addr, BinOp, Cond, FBinOp, IndexOperand, Operand, Register, RegisterSize, REG_IP0, REG_S0,
+    REG_X0,
+};
+use crate::asm::common::{StackSlot, StructLayouts};
 use crate::asm::error::Error;
 use crate::common::Target;
 use crate::ir;
@@ -8,6 +14,15 @@ use std::collections::HashMap;
 
 fn mangle_bb(func: &str, bb: usize) -> String {
     format!(".L{func}_bb{bb}")
+}
+
+fn is_terminator(stmt: &ir::stmt::Stmt) -> bool {
+    matches!(
+        stmt.inner,
+        ir::stmt::StmtInner::Jump(_)
+            | ir::stmt::StmtInner::CJump(_)
+            | ir::stmt::StmtInner::Return(_)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -18,25 +33,142 @@ pub enum PtrBase {
 }
 
 pub struct FunctionGenerator<'a> {
-    pub func_id: &'a str,
-    pub frame: &'a StackFrame,
-    pub layouts: &'a StructLayouts,
-    pub target: Target,
-    pub insts: &'a mut Vec<Inst>,
-    pub next_vreg: &'a mut usize,
-    pub cond_map: &'a mut HashMap<usize, Cond>,
+    func_id: &'a str,
+    frame: &'a FrameLayout,
+    layouts: &'a StructLayouts,
+    target: Target,
+    insts: Vec<Instruction>,
+    next_vreg: usize,
+    cond_map: HashMap<usize, Cond>,
 }
 
 impl<'a> FunctionGenerator<'a> {
+    /// Creates a generator for one function body.  `next_vreg` seeds the
+    /// virtual-register counter from the IR body's high-water mark so the
+    /// copies introduced during phi lowering get fresh ids.
+    pub fn new(
+        func_id: &'a str,
+        frame: &'a FrameLayout,
+        layouts: &'a StructLayouts,
+        target: Target,
+        next_vreg: usize,
+    ) -> Self {
+        Self {
+            func_id,
+            frame,
+            layouts,
+            target,
+            insts: Vec::new(),
+            next_vreg,
+            cond_map: HashMap::new(),
+        }
+    }
+
+    /// Lowers `blocks` to the function's flat instruction stream: each
+    /// block is emitted in order with its phi-derived edge copies woven
+    /// in before the terminator, then the synthesised split-edge blocks
+    /// are appended.  The phi placement and edge splitting are computed
+    /// by [`phi_lowering::plan`]; this method owns the walk and emission.
+    /// Consumes the generator and returns the produced instructions.
+    pub fn generate(
+        mut self,
+        blocks: &[ir::function::BasicBlock],
+    ) -> Result<Vec<Instruction>, Error> {
+        let plan = phi_lowering::plan(blocks);
+
+        for (idx, block) in plan.blocks.iter().enumerate() {
+            self.emit_label(&block.label);
+            self.emit_block_body(
+                &block.body,
+                plan.pending_inserts.get(&idx).map(Vec::as_slice),
+            )?;
+        }
+        self.emit_split_edges(&plan.splits)?;
+
+        Ok(self.insts)
+    }
+
+    /// Emits a block body, injecting the edge copies immediately before
+    /// the block's terminator (or at the end when the block has none).
+    fn emit_block_body(
+        &mut self,
+        body: &[ir::stmt::Stmt],
+        edge_copies: Option<&[ParallelCopy]>,
+    ) -> Result<(), Error> {
+        match body.iter().rposition(is_terminator) {
+            Some(pos) => {
+                for stmt in &body[..pos] {
+                    self.emit_stmt(stmt)?;
+                }
+                self.emit_parallel_copies(edge_copies)?;
+                for stmt in &body[pos..] {
+                    self.emit_stmt(stmt)?;
+                }
+            }
+            None => {
+                for stmt in body {
+                    self.emit_stmt(stmt)?;
+                }
+                self.emit_parallel_copies(edge_copies)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits the synthesised split-edge blocks: each carries its phi
+    /// copies followed by an unconditional jump to the original successor.
+    fn emit_split_edges(&mut self, splits: &[SplitEdge]) -> Result<(), Error> {
+        for split in splits {
+            self.emit_label(&split.label);
+            self.emit_parallel_copies(Some(&split.copies))?;
+            self.emit_stmt(&ir::stmt::Stmt::as_jump(split.succ_label.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Sequences a parallel-copy bundle into individual moves: copies
+    /// whose destination feeds no other pending copy go first; a residual
+    /// cycle is broken by routing one destination through a fresh temp.
+    fn emit_parallel_copies(&mut self, copies: Option<&[ParallelCopy]>) -> Result<(), Error> {
+        let Some(copies) = copies else {
+            return Ok(());
+        };
+
+        let mut pending = copies.to_vec();
+        while !pending.is_empty() {
+            if let Some(idx) = phi_lowering::find_ready_copy(&pending) {
+                let copy = pending.remove(idx);
+                self.emit_copy(&copy.dst, &copy.src)?;
+                continue;
+            }
+
+            let cycle_dst = pending[0].dst.clone();
+            let temp = ir::Operand::from(ir::Local::new(
+                cycle_dst.dtype().clone(),
+                ir::LocalId(self.fresh_vreg()),
+            ));
+            self.emit_copy(&temp, &cycle_dst)?;
+
+            for copy in &mut pending {
+                if phi_lowering::same_operand(&copy.src, &cycle_dst) {
+                    copy.src = temp.clone();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn fresh_vreg(&mut self) -> usize {
-        let v = *self.next_vreg;
-        *self.next_vreg += 1;
+        let v = self.next_vreg;
+        self.next_vreg += 1;
         v
     }
 
     pub fn emit_label(&mut self, label: &ir::BlockLabel) {
         if let ir::BlockLabel::BasicBlock(n) = label {
-            self.insts.push(Inst::Label(mangle_bb(self.func_id, *n)));
+            self.insts
+                .push(Instruction::Label(mangle_bb(self.func_id, *n)));
         }
     }
 
@@ -46,16 +178,12 @@ impl<'a> FunctionGenerator<'a> {
 
         match src {
             Operand::Register(r) => {
-                self.insts.push(Inst::Str { size, src: r, addr });
+                self.insts.push(Instruction::Str { size, src: r, addr });
             }
             Operand::Immediate(imm) => {
                 let tmp = self.fresh_vreg();
-                self.insts.push(Inst::Mov {
-                    size,
-                    dst: Register::Virtual(tmp),
-                    src: Operand::Immediate(imm),
-                });
-                self.insts.push(Inst::Str {
+                self.emit_scalar_to_reg(size, Register::Virtual(tmp), Operand::Immediate(imm));
+                self.insts.push(Instruction::Str {
                     size,
                     src: Register::Virtual(tmp),
                     addr,
@@ -67,13 +195,59 @@ impl<'a> FunctionGenerator<'a> {
 
     pub fn emit_load(&mut self, s: &ir::stmt::LoadStmt) -> Result<(), Error> {
         let dst = Self::operand_vreg(&s.dst)?;
-        let size = dtype_to_regsize(s.dst.dtype())?;
+        let size = RegisterSize::try_from(s.dst.dtype())?;
 
         let addr = self.lower_ptr_as_addr(&s.ptr)?;
-        self.insts.push(Inst::Ldr {
+        self.insts.push(Instruction::Ldr {
             size,
             dst: Register::Virtual(dst),
             addr,
+        });
+        Ok(())
+    }
+
+    pub fn emit_fbiop(&mut self, s: &ir::stmt::FBiOpStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let lhs = self.lower_float_to_reg(&s.left)?;
+        let rhs = self.lower_float_to_reg(&s.right)?;
+        let op = float_op_to_fbinop(&s.kind);
+
+        self.insts.push(Instruction::FBinOp {
+            op,
+            dst: Register::Virtual(dst),
+            lhs,
+            rhs,
+        });
+        Ok(())
+    }
+
+    pub fn emit_fcmp(&mut self, s: &ir::stmt::FCmpStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let lhs = self.lower_float_to_reg(&s.left)?;
+        let rhs = self.lower_float_to_reg(&s.right)?;
+        let cond = float_cmp_op_to_cond(&s.kind);
+
+        self.cond_map.insert(dst, cond);
+        self.insts.push(Instruction::FCmp { lhs, rhs });
+        Ok(())
+    }
+
+    pub fn emit_sitofp(&mut self, s: &ir::stmt::SIToFPStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let src = self.lower_int_to_reg(&s.src)?;
+        self.insts.push(Instruction::Scvtf {
+            dst: Register::Virtual(dst),
+            src,
+        });
+        Ok(())
+    }
+
+    pub fn emit_fptosi(&mut self, s: &ir::stmt::FPToSIStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let src = self.lower_float_to_reg(&s.src)?;
+        self.insts.push(Instruction::Fcvtzs {
+            dst: Register::Virtual(dst),
+            src,
         });
         Ok(())
     }
@@ -85,9 +259,9 @@ impl<'a> FunctionGenerator<'a> {
         let rhs = self.lower_int(&s.right)?;
         let op = arith_op_to_binop(&s.kind);
 
-        self.insts.push(Inst::BinOp {
+        self.insts.push(Instruction::BinOp {
             op,
-            size: RegSize::W32,
+            size: RegisterSize::W32,
             dst: Register::Virtual(dst),
             lhs,
             rhs,
@@ -102,8 +276,8 @@ impl<'a> FunctionGenerator<'a> {
         let cond = cmp_op_to_cond(&s.kind);
 
         self.cond_map.insert(dst, cond);
-        self.insts.push(Inst::Cmp {
-            size: RegSize::W32,
+        self.insts.push(Instruction::Cmp {
+            size: RegisterSize::W32,
             lhs,
             rhs,
         });
@@ -120,17 +294,17 @@ impl<'a> FunctionGenerator<'a> {
         let true_label = self.mangle_block_label(&s.true_label);
         let false_label = self.mangle_block_label(&s.false_label);
 
-        self.insts.push(Inst::BCond {
+        self.insts.push(Instruction::BCond {
             cond,
             label: true_label,
         });
-        self.insts.push(Inst::B { label: false_label });
+        self.insts.push(Instruction::B { label: false_label });
         Ok(())
     }
 
     pub fn emit_jump(&mut self, s: &ir::stmt::JumpStmt) {
         let target = self.mangle_block_label(&s.target);
-        self.insts.push(Inst::B { label: target });
+        self.insts.push(Instruction::B { label: target });
     }
 
     pub fn emit_gep(&mut self, s: &ir::stmt::GepStmt) -> Result<(), Error> {
@@ -165,31 +339,40 @@ impl<'a> FunctionGenerator<'a> {
     }
 
     pub fn emit_call(&mut self, s: &ir::stmt::CallStmt) -> Result<(), Error> {
-        self.insts.push(Inst::SaveCallerRegs);
+        let locs = classify_args(s.args.iter().map(ir::Operand::dtype))?;
+        let stack_bytes = outgoing_stack_bytes(&locs);
 
-        let nargs = s.args.len();
-        if nargs > 8 {
-            let stack_bytes = align_up(((nargs - 8) as i64) * 8, 16);
-            self.insts.push(Inst::SubSp { imm: stack_bytes });
+        self.insts.push(Instruction::SaveCallerRegs);
 
-            for (i, arg) in s.args.iter().enumerate().skip(8) {
-                self.emit_call_stack_arg(arg, ((i - 8) as i64) * 8)?;
+        if stack_bytes > 0 {
+            self.insts.push(Instruction::SubSp { imm: stack_bytes });
+        }
+
+        // Stack arguments are settled before register arguments: the
+        // stack-store path borrows `x16` as scratch, which would
+        // clobber any value already settled into `x0..x7`.
+        for (arg, loc) in s.args.iter().zip(&locs) {
+            if let ArgumentLocation::Stack { offset } = *loc {
+                self.emit_stack_arg(arg, offset)?;
             }
         }
 
-        for (i, arg) in s.args.iter().enumerate().take(8) {
-            self.emit_call_reg_arg(arg, i as u8)?;
+        for (arg, loc) in s.args.iter().zip(&locs) {
+            match *loc {
+                ArgumentLocation::Gpr(n) => self.emit_gpr_arg(arg, n)?,
+                ArgumentLocation::Fpr(n) => self.emit_fpr_arg(arg, n)?,
+                ArgumentLocation::Stack { .. } => {}
+            }
         }
 
         let func_name = self.target.mangle_symbol(&s.link_name);
-        self.insts.push(Inst::Bl { func: func_name });
+        self.insts.push(Instruction::Bl { func: func_name });
 
-        if nargs > 8 {
-            let stack_bytes = align_up(((nargs - 8) as i64) * 8, 16);
-            self.insts.push(Inst::AddSp { imm: stack_bytes });
+        if stack_bytes > 0 {
+            self.insts.push(Instruction::AddSp { imm: stack_bytes });
         }
 
-        self.insts.push(Inst::RestoreCallerRegs);
+        self.insts.push(Instruction::RestoreCallerRegs);
 
         if let Some(res) = &s.res {
             match res {
@@ -207,13 +390,9 @@ impl<'a> FunctionGenerator<'a> {
     pub fn emit_return(&mut self, s: &ir::stmt::ReturnStmt) -> Result<(), Error> {
         if let Some(v) = &s.val {
             let (op, size) = self.lower_value(v)?;
-            self.insts.push(Inst::Mov {
-                size,
-                dst: Register::Physical(0),
-                src: op,
-            });
+            self.insts.push(return_inst(size, op));
         }
-        self.insts.push(Inst::Ret);
+        self.insts.push(Instruction::Ret);
         Ok(())
     }
 
@@ -258,14 +437,11 @@ impl<'a> FunctionGenerator<'a> {
 
         match (base_kind, base_slot) {
             (PtrBase::Stack, Some(slot)) => {
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst: Register::Virtual(new_ptr),
-                    addr: Addr::BaseOff {
-                        base: Register::Physical(29),
-                        offset: slot.offset_from_fp,
-                    },
+                    addr: FrameLayout::local_addr(slot),
                 });
-                self.insts.push(Inst::Gep {
+                self.insts.push(Instruction::Gep {
                     dst: Register::Virtual(new_ptr),
                     base: Register::Virtual(new_ptr),
                     index,
@@ -278,11 +454,11 @@ impl<'a> FunctionGenerator<'a> {
                 ));
             }
             (PtrBase::Global(sym), _) => {
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst: Register::Virtual(new_ptr),
                     addr: Addr::Global(sym),
                 });
-                self.insts.push(Inst::Gep {
+                self.insts.push(Instruction::Gep {
                     dst: Register::Virtual(new_ptr),
                     base: Register::Virtual(new_ptr),
                     index,
@@ -290,7 +466,7 @@ impl<'a> FunctionGenerator<'a> {
                 });
             }
             (PtrBase::Register(base_v), _) => {
-                self.insts.push(Inst::Gep {
+                self.insts.push(Instruction::Gep {
                     dst: Register::Virtual(new_ptr),
                     base: Register::Virtual(base_v),
                     index,
@@ -310,12 +486,9 @@ impl<'a> FunctionGenerator<'a> {
     ) -> Result<(), Error> {
         match (base_kind, base_slot) {
             (PtrBase::Stack, Some(slot)) => {
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst: Register::Virtual(dst),
-                    addr: Addr::BaseOff {
-                        base: Register::Physical(29),
-                        offset: slot.offset_from_fp + offset,
-                    },
+                    addr: FrameLayout::local_addr_with_offset(slot, offset),
                 });
             }
             (PtrBase::Stack, None) => {
@@ -324,14 +497,14 @@ impl<'a> FunctionGenerator<'a> {
                 ));
             }
             (PtrBase::Global(sym), _) => {
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst: Register::Virtual(dst),
                     addr: Addr::Global(sym),
                 });
                 if offset != 0 {
-                    self.insts.push(Inst::BinOp {
+                    self.insts.push(Instruction::BinOp {
                         op: BinOp::Add,
-                        size: RegSize::X64,
+                        size: RegisterSize::X64,
                         dst: Register::Virtual(dst),
                         lhs: Register::Virtual(dst),
                         rhs: Operand::Immediate(offset),
@@ -339,7 +512,7 @@ impl<'a> FunctionGenerator<'a> {
                 }
             }
             (PtrBase::Register(base_v), _) => {
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst: Register::Virtual(dst),
                     addr: Addr::BaseOff {
                         base: Register::Virtual(base_v),
@@ -351,109 +524,115 @@ impl<'a> FunctionGenerator<'a> {
         Ok(())
     }
 
-    fn emit_call_stack_arg(&mut self, arg: &ir::Operand, stack_offset: i64) -> Result<(), Error> {
+    /// Settles `arg` into the GPR-class argument slot `x{reg_idx}`
+    /// (`w{reg_idx}` for 32-bit operands).  Pointer / array operands
+    /// route through [`Self::emit_ptr_to_reg`] so an `alloca`-backed
+    /// slot lowers to a frame-relative `lea`; scalar operands lower
+    /// to a direct `mov` at the operand's natural width.
+    fn emit_gpr_arg(&mut self, arg: &ir::Operand, reg_idx: u8) -> Result<(), Error> {
+        let dst = Register::Physical(reg_idx);
         if matches!(
             arg.dtype(),
             ir::Dtype::Pointer { .. } | ir::Dtype::Array { .. }
         ) {
-            self.emit_ptr_to_reg(arg, Register::Physical(16))?;
-            self.insts.push(Inst::Str {
-                size: RegSize::X64,
-                src: Register::Physical(16),
-                addr: Addr::BaseOff {
-                    base: Register::StackPointer,
-                    offset: stack_offset,
-                },
-            });
+            self.emit_ptr_to_reg(arg, dst)
         } else {
-            let (op, _size) = self.lower_value(arg)?;
-            match op {
-                Operand::Immediate(imm) => {
-                    self.insts.push(Inst::Mov {
-                        size: RegSize::W32,
-                        dst: Register::Physical(16),
-                        src: Operand::Immediate(imm),
-                    });
-                    self.insts.push(Inst::Str {
-                        size: RegSize::W32,
-                        src: Register::Physical(16),
-                        addr: Addr::BaseOff {
-                            base: Register::StackPointer,
-                            offset: stack_offset,
-                        },
-                    });
-                }
-                Operand::Register(r) => {
-                    self.insts.push(Inst::Str {
-                        size: RegSize::W32,
-                        src: r,
-                        addr: Addr::BaseOff {
-                            base: Register::StackPointer,
-                            offset: stack_offset,
-                        },
-                    });
-                }
+            let (op, size) = self.lower_value(arg)?;
+            self.insts.push(Instruction::Mov { size, dst, src: op });
+            Ok(())
+        }
+    }
+
+    /// Settles `arg` into the FPR-class argument slot `s{reg_idx}`
+    /// via `fmov`.  Only reachable for floating-point operands; the
+    /// pointer / array short-circuit in [`Self::emit_gpr_arg`] does
+    /// not apply because no TeaLang pointer is ever AAPCS64-routed
+    /// through the FPR file.
+    fn emit_fpr_arg(&mut self, arg: &ir::Operand, reg_idx: u8) -> Result<(), Error> {
+        let (op, size) = self.lower_value(arg)?;
+        if size != RegisterSize::S32 {
+            return Err(Error::UnsupportedDtype {
+                dtype: arg.dtype().clone(),
+            });
+        }
+        self.insts.push(Instruction::Fmov {
+            dst: Register::Physical(reg_idx),
+            src: op,
+        });
+        Ok(())
+    }
+
+    /// Writes `arg` into the caller's outgoing-arg area at
+    /// `[sp, #stack_offset]`.  Immediate scalars are first
+    /// materialised through `x16`/`w16`/`s16` because aarch64 has no
+    /// store-immediate form; pointer / array operands materialise
+    /// through `emit_ptr_to_reg` for the same `lea`-respecting reason
+    /// as the GPR path.
+    fn emit_stack_arg(&mut self, arg: &ir::Operand, stack_offset: i64) -> Result<(), Error> {
+        let addr = outgoing_arg_addr(stack_offset);
+
+        if matches!(
+            arg.dtype(),
+            ir::Dtype::Pointer { .. } | ir::Dtype::Array { .. }
+        ) {
+            let scratch = Register::Physical(REG_IP0);
+            self.emit_ptr_to_reg(arg, scratch)?;
+            self.insts.push(Instruction::Str {
+                size: RegisterSize::X64,
+                src: scratch,
+                addr,
+            });
+            return Ok(());
+        }
+
+        let (op, size) = self.lower_value(arg)?;
+        let src_reg = match op {
+            Operand::Register(r) => r,
+            Operand::Immediate(imm) => {
+                let scratch = Register::Physical(REG_IP0);
+                self.emit_scalar_to_reg(size, scratch, Operand::Immediate(imm));
+                scratch
             }
-        }
+        };
+        self.insts.push(Instruction::Str {
+            size,
+            src: src_reg,
+            addr,
+        });
         Ok(())
     }
 
-    fn emit_call_reg_arg(&mut self, arg: &ir::Operand, reg_idx: u8) -> Result<(), Error> {
-        if matches!(
-            arg.dtype(),
-            ir::Dtype::Pointer { .. } | ir::Dtype::Array { .. }
-        ) {
-            self.emit_ptr_to_reg(arg, Register::Physical(reg_idx))?;
-        } else {
-            let (op, _size) = self.lower_value(arg)?;
-            self.insts.push(Inst::Mov {
-                size: RegSize::W32,
-                dst: Register::Physical(reg_idx),
-                src: op,
-            });
-        }
-        Ok(())
-    }
-
+    /// Lifts the AAPCS64 return value out of `x0` (or `s0` for FP
+    /// returns) into the vreg named by `res`.  Dispatch is driven by
+    /// the return dtype's [`RegSize`], so adding a new scalar class
+    /// (e.g. `Dtype::F32 -> RegSize::S32`) requires only that
+    /// `RegisterSize`'s `TryFrom<&ir::Dtype>` learns the new mapping.
     fn emit_call_result(&mut self, res: &ir::Local) -> Result<(), Error> {
-        let dst = res.id.0;
-        match &res.dtype {
-            ir::Dtype::I32 => {
-                self.insts.push(Inst::Mov {
-                    size: RegSize::W32,
-                    dst: Register::Virtual(dst),
-                    src: Operand::Register(Register::Physical(0)),
-                });
-                Ok(())
-            }
-            other => Err(Error::UnsupportedDtype {
-                dtype: other.clone(),
-            }),
-        }
+        let dst = Register::Virtual(res.id.0);
+        let size = RegisterSize::try_from(&res.dtype)?;
+        self.insts.push(return_value_load(size, dst));
+        Ok(())
     }
 
     fn emit_ptr_to_reg(&mut self, arg: &ir::Operand, dst: Register) -> Result<(), Error> {
         let (base_kind, slot) = self.lower_ptr(arg)?;
         match base_kind {
             PtrBase::Register(v) => {
-                self.insts.push(Inst::Mov {
-                    size: RegSize::X64,
+                self.insts.push(Instruction::Mov {
+                    size: RegisterSize::X64,
                     dst,
                     src: Operand::Register(Register::Virtual(v)),
                 });
             }
             PtrBase::Stack => {
                 let slot = slot.ok_or_else(|| Error::Internal("missing stack slot".into()))?;
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst,
-                    addr: Addr::BaseOff {
-                        base: Register::Physical(29),
-                        offset: slot.offset_from_fp,
-                    },
+                    addr: FrameLayout::local_addr(slot),
                 });
             }
             PtrBase::Global(sym) => {
-                self.insts.push(Inst::Lea {
+                self.insts.push(Instruction::Lea {
                     dst,
                     addr: Addr::Global(sym),
                 });
@@ -492,8 +671,8 @@ impl<'a> FunctionGenerator<'a> {
             Operand::Register(r) => Ok(r),
             Operand::Immediate(imm) => {
                 let tmp = self.fresh_vreg();
-                self.insts.push(Inst::Mov {
-                    size: RegSize::W32,
+                self.insts.push(Instruction::Mov {
+                    size: RegisterSize::W32,
                     dst: Register::Virtual(tmp),
                     src: Operand::Immediate(imm),
                 });
@@ -502,12 +681,53 @@ impl<'a> FunctionGenerator<'a> {
         }
     }
 
-    fn lower_value(&self, val: &ir::Operand) -> Result<(Operand, RegSize), Error> {
+    fn lower_float(&self, val: &ir::Operand) -> Result<Operand, Error> {
         match val {
-            ir::Operand::Const(c) => Ok((Operand::Immediate(c.val), RegSize::W32)),
+            ir::Operand::FloatConst(c) => Ok(Operand::Immediate(i64::from(c.val.to_bits()))),
+            ir::Operand::Local(l) => {
+                if !matches!(l.dtype, ir::Dtype::F32) {
+                    return Err(Error::UnsupportedDtype {
+                        dtype: l.dtype.clone(),
+                    });
+                }
+                if self.frame.has_alloca(l.id.0) {
+                    return Err(Error::UnsupportedOperand {
+                        what: format!("float operand references alloca pointer %r{}", l.id.0),
+                    });
+                }
+                Ok(Operand::Register(Register::Virtual(l.id.0)))
+            }
+            ir::Operand::Const(_) | ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
+                what: format!("unsupported float operand: {}", val),
+            }),
+        }
+    }
+
+    fn lower_float_to_reg(&mut self, val: &ir::Operand) -> Result<Register, Error> {
+        match self.lower_float(val)? {
+            Operand::Register(r) => Ok(r),
+            Operand::Immediate(bits) => {
+                let tmp = self.fresh_vreg();
+                self.insts.push(Instruction::Fmov {
+                    dst: Register::Virtual(tmp),
+                    src: Operand::Immediate(bits),
+                });
+                Ok(Register::Virtual(tmp))
+            }
+        }
+    }
+
+    fn lower_value(&self, val: &ir::Operand) -> Result<(Operand, RegisterSize), Error> {
+        match val {
+            ir::Operand::Const(c) => Ok((Operand::Immediate(c.val), RegisterSize::W32)),
+            ir::Operand::FloatConst(c) => Ok((
+                Operand::Immediate(i64::from(c.val.to_bits())),
+                RegisterSize::S32,
+            )),
             ir::Operand::Local(l) => {
                 let size = match &l.dtype {
-                    ir::Dtype::I1 | ir::Dtype::I32 => RegSize::W32,
+                    ir::Dtype::I1 | ir::Dtype::I32 => RegisterSize::W32,
+                    ir::Dtype::F32 => RegisterSize::S32,
                     ir::Dtype::Pointer { .. } => {
                         if self.frame.has_alloca(l.id.0) {
                             return Err(Error::UnsupportedOperand {
@@ -517,7 +737,7 @@ impl<'a> FunctionGenerator<'a> {
                                 ),
                             });
                         }
-                        RegSize::X64
+                        RegisterSize::X64
                     }
                     other => {
                         return Err(Error::UnsupportedDtype {
@@ -530,9 +750,15 @@ impl<'a> FunctionGenerator<'a> {
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: "unexpected global variable in value position".into(),
             }),
-            ir::Operand::FloatConst(_) => Err(Error::UnsupportedDtype {
-                dtype: ir::Dtype::F32,
-            }),
+        }
+    }
+
+    fn emit_scalar_to_reg(&mut self, size: RegisterSize, dst: Register, src: Operand) {
+        match size {
+            RegisterSize::S32 => self.insts.push(Instruction::Fmov { dst, src }),
+            RegisterSize::W32 | RegisterSize::X64 => {
+                self.insts.push(Instruction::Mov { size, dst, src })
+            }
         }
     }
 
@@ -541,10 +767,7 @@ impl<'a> FunctionGenerator<'a> {
         match base_kind {
             PtrBase::Stack => {
                 let slot = slot.ok_or_else(|| Error::Internal("missing stack slot".into()))?;
-                Ok(Addr::BaseOff {
-                    base: Register::Physical(29),
-                    offset: slot.offset_from_fp,
-                })
+                Ok(FrameLayout::local_addr(slot))
             }
             PtrBase::Global(sym) => Ok(Addr::Global(sym)),
             PtrBase::Register(v) => Ok(Addr::BaseOff {
@@ -635,9 +858,10 @@ impl<'a> FunctionGenerator<'a> {
             Load(s) => self.emit_load(s),
             BiOp(s) => self.emit_biop(s),
             Cmp(s) => self.emit_cmp(s),
-            FBiOp(_) | FCmp(_) | SIToFP(_) | FPToSI(_) => Err(Error::UnsupportedDtype {
-                dtype: ir::Dtype::F32,
-            }),
+            FBiOp(s) => self.emit_fbiop(s),
+            FCmp(s) => self.emit_fcmp(s),
+            SIToFP(s) => self.emit_sitofp(s),
+            FPToSI(s) => self.emit_fptosi(s),
             CJump(s) => self.emit_cjump(s),
             Jump(s) => {
                 self.emit_jump(s);
@@ -654,7 +878,7 @@ impl<'a> FunctionGenerator<'a> {
 
     pub fn emit_copy(&mut self, dst: &ir::Operand, src: &ir::Operand) -> Result<(), Error> {
         let dst_vreg = Self::operand_vreg(dst)?;
-        let size = dtype_to_regsize(dst.dtype())?;
+        let size = RegisterSize::try_from(dst.dtype())?;
 
         let src_op = match src {
             ir::Operand::Const(c) => Operand::Immediate(c.val),
@@ -664,18 +888,21 @@ impl<'a> FunctionGenerator<'a> {
                     what: "global variable in phi copy".into(),
                 });
             }
-            ir::Operand::FloatConst(_) => {
-                return Err(Error::UnsupportedDtype {
-                    dtype: ir::Dtype::F32,
-                });
-            }
+            ir::Operand::FloatConst(c) => Operand::Immediate(i64::from(c.val.to_bits())),
         };
 
-        self.insts.push(Inst::Mov {
-            size,
-            dst: Register::Virtual(dst_vreg),
-            src: src_op,
-        });
+        let inst = match size {
+            RegisterSize::W32 | RegisterSize::X64 => Instruction::Mov {
+                size,
+                dst: Register::Virtual(dst_vreg),
+                src: src_op,
+            },
+            RegisterSize::S32 => Instruction::Fmov {
+                dst: Register::Virtual(dst_vreg),
+                src: src_op,
+            },
+        };
+        self.insts.push(inst);
         Ok(())
     }
 
@@ -704,6 +931,50 @@ fn arith_op_to_binop(op: &ir::stmt::ArithBinOp) -> BinOp {
     }
 }
 
+fn float_op_to_fbinop(op: &ir::stmt::FloatBinOp) -> FBinOp {
+    match op {
+        ir::stmt::FloatBinOp::FAdd => FBinOp::FAdd,
+        ir::stmt::FloatBinOp::FSub => FBinOp::FSub,
+        ir::stmt::FloatBinOp::FMul => FBinOp::FMul,
+        ir::stmt::FloatBinOp::FDiv => FBinOp::FDiv,
+    }
+}
+
+/// Builds the instruction that places the callee's return value into
+/// its AAPCS64 register — `x0` (or `w0`) for integer/pointer returns
+/// and `s0` for floating-point returns.  Selection is driven by
+/// `size` so that adding a new scalar class only requires
+/// `RegisterSize`'s `TryFrom<&ir::Dtype>` to learn the new mapping.
+fn return_inst(size: RegisterSize, src: Operand) -> Instruction {
+    match size {
+        RegisterSize::W32 | RegisterSize::X64 => Instruction::Mov {
+            size,
+            dst: Register::Physical(REG_X0),
+            src,
+        },
+        RegisterSize::S32 => Instruction::Fmov {
+            dst: Register::Physical(REG_S0),
+            src,
+        },
+    }
+}
+
+/// Dual of [`return_inst`] for the caller side: builds the
+/// instruction that lifts the AAPCS64 return register into `dst`.
+fn return_value_load(size: RegisterSize, dst: Register) -> Instruction {
+    match size {
+        RegisterSize::W32 | RegisterSize::X64 => Instruction::Mov {
+            size,
+            dst,
+            src: Operand::Register(Register::Physical(REG_X0)),
+        },
+        RegisterSize::S32 => Instruction::Fmov {
+            dst,
+            src: Operand::Register(Register::Physical(REG_S0)),
+        },
+    }
+}
+
 fn cmp_op_to_cond(op: &ir::stmt::CmpPredicate) -> Cond {
     match op {
         ir::stmt::CmpPredicate::Eq => Cond::Eq,
@@ -712,5 +983,16 @@ fn cmp_op_to_cond(op: &ir::stmt::CmpPredicate) -> Cond {
         ir::stmt::CmpPredicate::Sle => Cond::Le,
         ir::stmt::CmpPredicate::Sgt => Cond::Gt,
         ir::stmt::CmpPredicate::Sge => Cond::Ge,
+    }
+}
+
+fn float_cmp_op_to_cond(op: &ir::stmt::FloatCmpPredicate) -> Cond {
+    match op {
+        ir::stmt::FloatCmpPredicate::Oeq => Cond::Eq,
+        ir::stmt::FloatCmpPredicate::One => Cond::Ne,
+        ir::stmt::FloatCmpPredicate::Olt => Cond::Lt,
+        ir::stmt::FloatCmpPredicate::Ole => Cond::Le,
+        ir::stmt::FloatCmpPredicate::Ogt => Cond::Gt,
+        ir::stmt::FloatCmpPredicate::Oge => Cond::Ge,
     }
 }
